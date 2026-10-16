@@ -86,7 +86,6 @@ int sceRegMgrSetStr(unsigned int regId, const char *buf, size_t size);
 #define REGKEY_DEVENV_TOOL_SHELLUI_disp_titleid 2013448470U
 #define REGKEY_DEVENV_TOOL_SHELLUI_content_info 2013448648U
 #define REGKEY_SYSTEM_SPECIFIC_show_mode     42336768U
-#define REGKEY_SYSTEM_SPECIFIC_idu_mode      42336512U
 #define REGKEY_SYSTEM_language               33685504U
 
 int  sceKernelGetGPO(unsigned int *);
@@ -1217,7 +1216,6 @@ try_registry_devkit_panel(void) {
     { REGKEY_DEVENV_TOOL_SHELLUI_disp_titleid, "DEVENV_TOOL_SHELLUI_disp_titleid" },
     { REGKEY_DEVENV_TOOL_SHELLUI_content_info, "DEVENV_TOOL_SHELLUI_content_info" },
     { REGKEY_SYSTEM_SPECIFIC_show_mode,        "SYSTEM_SPECIFIC_show_mode" },
-    { REGKEY_SYSTEM_SPECIFIC_idu_mode,         "SYSTEM_SPECIFIC_idu_mode" },
     { REGKEY_SYSTEM_language,                  "SYSTEM_language (reference)" },
   };
   int nkeys = sizeof(int_keys) / sizeof(int_keys[0]);

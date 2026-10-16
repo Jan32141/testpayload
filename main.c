@@ -946,9 +946,18 @@ enable_testkit(void) {
   fp = fopen(path, "w");
   if(!fp) { perror(path); return; }
 
-  fprintf(fp, "=== ENABLE TESTKIT FLAGS ===\n\n");
+  fprintf(fp, "=== ENABLE DEVKIT/TESTKIT FLAGS ===\n\n");
 
-  /* 1. QA FLAGS — enable testkit-relevant bits */
+  /* NOTE: TARGETID, SECURITY_FLAGS, UTOKEN_FLAGS are in a hardware-protected
+     memory region. Direct kernel_setchar() on them causes a kernel panic.
+     Only kernel_set_qaflags() is safe — it uses a special internal path. */
+
+  {
+    uint8_t tid = kernel_getchar(KERNEL_ADDRESS_TARGETID);
+    fprintf(fp, "TARGETID: 0x%02x = %s (read-only, HW protected)\n\n", tid, targetid_name(tid));
+  }
+
+  /* 1. QA FLAGS — enable testkit-relevant bits (safe via SDK function) */
   {
     uint8_t qa[16] = {0};
     kernel_get_qaflags(qa);
@@ -986,47 +995,15 @@ enable_testkit(void) {
     fprintf(fp, "\n");
   }
 
-  /* 2. SECURITY_FLAGS — enable debug mode bits */
+  /* SECURITY_FLAGS and UTOKEN_FLAGS: HW-protected, read only */
   {
     uint8_t sf = kernel_getchar(KERNEL_ADDRESS_SECURITY_FLAGS);
-    fprintf(fp, "SECURITY_FLAGS before: 0x%02x\n", sf);
-
-    /* bit 0: DEBUG_SETTING_MODE
-       bit 2: ALLOW_UNSIGNED_CODE
-       bit 3: ALLOW_MAPPED_WRITE_EXEC
-       bit 5: INTERNAL_PROCESS_MODE
-       bit 6: ALLOW_DEBUG_PROCESSES
-       bit 7: DEVKIT_MODE */
-    sf |= (1<<0) | (1<<2) | (1<<3) | (1<<5) | (1<<6) | (1<<7);
-
-    if(kernel_setchar(KERNEL_ADDRESS_SECURITY_FLAGS, sf)) {
-      fprintf(fp, "  FAILED to set SECURITY_FLAGS\n");
-      printf("enable_testkit: FAILED to set SECURITY_FLAGS\n");
-    } else {
-      fprintf(fp, "SECURITY_FLAGS after:  0x%02x\n", sf);
-      fprintf(fp, "  SECURITY_FLAGS SET OK\n");
-      printf("enable_testkit: SECURITY_FLAGS set\n");
-    }
-    fprintf(fp, "\n");
-  }
-
-  /* 3. UTOKEN_FLAGS — enable all */
-  {
     uint8_t ut = kernel_getchar(KERNEL_ADDRESS_UTOKEN_FLAGS);
-    fprintf(fp, "UTOKEN_FLAGS before: 0x%02x\n", ut);
-    ut = 0xff;
-    if(kernel_setchar(KERNEL_ADDRESS_UTOKEN_FLAGS, ut)) {
-      fprintf(fp, "  FAILED to set UTOKEN_FLAGS\n");
-      printf("enable_testkit: FAILED to set UTOKEN_FLAGS\n");
-    } else {
-      fprintf(fp, "UTOKEN_FLAGS after:  0x%02x\n", ut);
-      fprintf(fp, "  UTOKEN_FLAGS SET OK\n");
-      printf("enable_testkit: UTOKEN_FLAGS set\n");
-    }
-    fprintf(fp, "\n");
+    fprintf(fp, "SECURITY_FLAGS: 0x%02x (read-only, HW protected)\n", sf);
+    fprintf(fp, "UTOKEN_FLAGS:   0x%02x (read-only, HW protected)\n\n", ut);
   }
 
-  /* 4. Elevate current process: uid 0, full caps, full attrs, jailbreak */
+  /* 2. Elevate current process: uid 0, full caps, full attrs, jailbreak */
   {
     fprintf(fp, "--- PROCESS ELEVATION (pid %d) ---\n", pid);
 
@@ -1070,6 +1047,49 @@ enable_testkit(void) {
 
     fprintf(fp, "  PROCESS ELEVATED OK\n");
     printf("enable_testkit: process elevated to root + full privs\n");
+    fprintf(fp, "\n");
+  }
+
+  /* 5. Elevate SceShellUI so the settings app shows the devkit panel */
+  {
+    int mib[4] = {1, 14, 8, 0};
+    size_t buf_size;
+    uint8_t *buf;
+    pid_t shell_pid = -1;
+    pid_t mypid = getpid();
+
+    fprintf(fp, "--- SHELLUI ELEVATION ---\n");
+
+    if(!sysctl(mib, 4, 0, &buf_size, 0, 0) && (buf = malloc(buf_size))) {
+      if(!sysctl(mib, 4, buf, &buf_size, 0, 0)) {
+        for(uint8_t *ptr = buf; ptr < (buf + buf_size);) {
+          int ki_structsize = *(int*)ptr;
+          pid_t ki_pid = *(pid_t*)&ptr[72];
+          char *ki_tdname = (char*)&ptr[447];
+          ptr += ki_structsize;
+          if(ki_pid != mypid && !strcmp(ki_tdname, "SceShellUI")) {
+            shell_pid = ki_pid;
+          }
+        }
+      }
+      free(buf);
+    }
+
+    if(shell_pid > 0) {
+      fprintf(fp, "  found SceShellUI pid %d\n", shell_pid);
+
+      kernel_set_ucred_authid(shell_pid, 0x4800000000010003UL);
+      uint8_t fc[16]; memset(fc, 0xff, sizeof(fc));
+      kernel_set_ucred_caps(shell_pid, fc);
+      uint8_t fa[32]; memset(fa, 0xff, sizeof(fa));
+      kernel_set_ucred_attrs(shell_pid, fa);
+
+      fprintf(fp, "  SceShellUI: authid + caps + attrs elevated\n");
+      printf("enable_testkit: SceShellUI (pid %d) elevated\n", shell_pid);
+    } else {
+      fprintf(fp, "  SceShellUI not found\n");
+      printf("enable_testkit: SceShellUI not found\n");
+    }
     fprintf(fp, "\n");
   }
 

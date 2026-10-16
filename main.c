@@ -935,9 +935,154 @@ write_proclist(void) {
   printf("wrote %s\n", path);
 }
 
+/* ========== ENABLE TESTKIT FLAGS ========== */
+static void
+enable_testkit(void) {
+  pid_t pid = getpid();
+  FILE* fp;
+  char path[256];
+
+  snprintf(path, sizeof(path), "%s/enable_testkit.txt", OUT_DIR);
+  fp = fopen(path, "w");
+  if(!fp) { perror(path); return; }
+
+  fprintf(fp, "=== ENABLE TESTKIT FLAGS ===\n\n");
+
+  /* 1. QA FLAGS — enable testkit-relevant bits */
+  {
+    uint8_t qa[16] = {0};
+    kernel_get_qaflags(qa);
+
+    fprintf(fp, "QA_FLAGS before: 0x");
+    for(int i = 0; i < 16; i++) fprintf(fp, "%02x", qa[i]);
+    fprintf(fp, "\n");
+
+    /* byte 0: INTERNAL_DEV(0), QA_ENABLED(1), ALLOW_DEBUG_MENU(2),
+               ALLOW_USB_MASS_STORAGE(5), ALLOW_HOST_FS(6), ALLOW_UPDATE_FROM_USB(7) */
+    qa[0] |= (1<<0) | (1<<1) | (1<<2) | (1<<5) | (1<<6) | (1<<7);
+
+    /* byte 1: ALLOW_EXTERNAL_HDD_NO_FORMAT(0), ALLOW_INSTALLATION_FROM_HOST(4) */
+    qa[1] |= (1<<0) | (1<<4);
+
+    /* byte 2: ENABLE_TESTKIT_FEATURES(0), ENABLE_NP_ENV_SWITCHING(1) */
+    qa[2] |= (1<<0) | (1<<1);
+
+    /* byte 3: ALLOW_SYSTEM_LEVEL_DEBUGGER(2) */
+    qa[3] |= (1<<2);
+
+    /* byte 4: WEAKEN_PORT_RESTRICTION(2) */
+    qa[4] |= (1<<2);
+
+    if(kernel_set_qaflags(qa)) {
+      fprintf(fp, "  FAILED to set QA flags\n");
+      printf("enable_testkit: FAILED to set QA flags\n");
+    } else {
+      fprintf(fp, "QA_FLAGS after:  0x");
+      for(int i = 0; i < 16; i++) fprintf(fp, "%02x", qa[i]);
+      fprintf(fp, "\n");
+      fprintf(fp, "  QA flags SET OK\n");
+      printf("enable_testkit: QA flags set\n");
+    }
+    fprintf(fp, "\n");
+  }
+
+  /* 2. SECURITY_FLAGS — enable debug mode bits */
+  {
+    uint8_t sf = kernel_getchar(KERNEL_ADDRESS_SECURITY_FLAGS);
+    fprintf(fp, "SECURITY_FLAGS before: 0x%02x\n", sf);
+
+    /* bit 0: DEBUG_SETTING_MODE
+       bit 2: ALLOW_UNSIGNED_CODE
+       bit 3: ALLOW_MAPPED_WRITE_EXEC
+       bit 5: INTERNAL_PROCESS_MODE
+       bit 6: ALLOW_DEBUG_PROCESSES
+       bit 7: DEVKIT_MODE */
+    sf |= (1<<0) | (1<<2) | (1<<3) | (1<<5) | (1<<6) | (1<<7);
+
+    if(kernel_setchar(KERNEL_ADDRESS_SECURITY_FLAGS, sf)) {
+      fprintf(fp, "  FAILED to set SECURITY_FLAGS\n");
+      printf("enable_testkit: FAILED to set SECURITY_FLAGS\n");
+    } else {
+      fprintf(fp, "SECURITY_FLAGS after:  0x%02x\n", sf);
+      fprintf(fp, "  SECURITY_FLAGS SET OK\n");
+      printf("enable_testkit: SECURITY_FLAGS set\n");
+    }
+    fprintf(fp, "\n");
+  }
+
+  /* 3. UTOKEN_FLAGS — enable all */
+  {
+    uint8_t ut = kernel_getchar(KERNEL_ADDRESS_UTOKEN_FLAGS);
+    fprintf(fp, "UTOKEN_FLAGS before: 0x%02x\n", ut);
+    ut = 0xff;
+    if(kernel_setchar(KERNEL_ADDRESS_UTOKEN_FLAGS, ut)) {
+      fprintf(fp, "  FAILED to set UTOKEN_FLAGS\n");
+      printf("enable_testkit: FAILED to set UTOKEN_FLAGS\n");
+    } else {
+      fprintf(fp, "UTOKEN_FLAGS after:  0x%02x\n", ut);
+      fprintf(fp, "  UTOKEN_FLAGS SET OK\n");
+      printf("enable_testkit: UTOKEN_FLAGS set\n");
+    }
+    fprintf(fp, "\n");
+  }
+
+  /* 4. Elevate current process: uid 0, full caps, full attrs, jailbreak */
+  {
+    fprintf(fp, "--- PROCESS ELEVATION (pid %d) ---\n", pid);
+
+    /* uid/gid to root */
+    kernel_set_ucred_uid(pid, 0);
+    kernel_set_ucred_ruid(pid, 0);
+    kernel_set_ucred_svuid(pid, 0);
+    kernel_set_ucred_rgid(pid, 0);
+    kernel_set_ucred_svgid(pid, 0);
+    fprintf(fp, "  uid/gid -> 0 (root)\n");
+
+    /* SCE authid: system-level */
+    kernel_set_ucred_authid(pid, 0x4800000000010003UL);
+    fprintf(fp, "  authid -> 0x4800000000010003 (PROSPERO_OS)\n");
+
+    /* full SCE caps */
+    uint8_t fullcaps[16];
+    memset(fullcaps, 0xff, sizeof(fullcaps));
+    kernel_set_ucred_caps(pid, fullcaps);
+    fprintf(fp, "  caps -> all 0xff (full privileges)\n");
+
+    /* full SCE attrs */
+    uint8_t fullattrs[32];
+    memset(fullattrs, 0xff, sizeof(fullattrs));
+    kernel_set_ucred_attrs(pid, fullattrs);
+    fprintf(fp, "  attrs -> all 0xff (full attributes)\n");
+
+    /* jailbreak: set rootdir and jaildir to root vnode */
+    intptr_t rootvnode = kernel_get_root_vnode();
+    if(rootvnode) {
+      kernel_set_proc_rootdir(pid, rootvnode);
+      kernel_set_proc_jaildir(pid, rootvnode);
+      fprintf(fp, "  rootdir/jaildir -> root vnode (0x%lx)\n", rootvnode);
+    }
+
+    /* escape prison: set to prison0 */
+    if(KERNEL_ADDRESS_PRISON0) {
+      kernel_set_ucred_prison(pid, KERNEL_ADDRESS_PRISON0);
+      fprintf(fp, "  prison -> prison0 (0x%lx)\n", KERNEL_ADDRESS_PRISON0);
+    }
+
+    fprintf(fp, "  PROCESS ELEVATED OK\n");
+    printf("enable_testkit: process elevated to root + full privs\n");
+    fprintf(fp, "\n");
+  }
+
+  fclose(fp);
+  printf("wrote %s\n", path);
+}
+
 int
 main(void) {
   mkdir(OUT_DIR, 0777);
+
+  /* enable testkit flags first, then dump everything (so dumps reflect new state) */
+  enable_testkit();
 
   write_flags();
   write_struct_dumps();
@@ -960,7 +1105,7 @@ main(void) {
   }
 
   printf("\ndone — all files in " OUT_DIR "\n");
-  notify("testpayload: all data dumped to " OUT_DIR);
+  notify("testpayload: testkit enabled + data dumped to " OUT_DIR);
 
   return 0;
 }

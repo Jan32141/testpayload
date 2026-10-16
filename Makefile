@@ -8,8 +8,9 @@ CFLAGS := -Wall -lkernel_sys -lSceRegMgr
 
 ELF := testpayload.elf
 KILLSHELL := killshell.elf
+REGDUMP := regdump.elf
 
-all: $(ELF) $(KILLSHELL)
+all: $(ELF) $(KILLSHELL) $(REGDUMP)
 
 $(ELF): main.c
 	$(CC) $(CFLAGS) $^ -o $@
@@ -17,8 +18,11 @@ $(ELF): main.c
 $(KILLSHELL): killshell.c
 	$(CC) -Wall -lkernel_sys $^ -o $@
 
+$(REGDUMP): regdump.c
+	$(CC) -Wall -lkernel_sys -lSceRegMgr $^ -o $@
+
 clean:
-	rm -f $(ELF) $(KILLSHELL)
+	rm -f $(ELF) $(KILLSHELL) $(REGDUMP)
 
 test: $(ELF)
 	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $^

@@ -73,6 +73,8 @@ int sceRegMgrGetInt(unsigned int regId, int *value);
 int sceRegMgrSetInt(unsigned int regId, int value);
 int sceRegMgrGetStr(unsigned int regId, char *buf, size_t size);
 int sceRegMgrSetStr(unsigned int regId, const char *buf, size_t size);
+int sceRegMgrNonSysGetInt(unsigned int regId, int *value);
+int sceRegMgrNonSysSetInt(unsigned int regId, int value);
 
 /* DEVENV registry key IDs (from ps5-payload-dev/regdump regmgr.h) */
 #define REGKEY_DEVENV_HOST_devkitname        2013331712U
@@ -1204,89 +1206,108 @@ try_registry_devkit_panel(void) {
   fprintf(fp, "=== REGISTRY APPROACH: DEVKIT PANEL ===\n\n");
   printf("registry: probing devkit panel keys...\n");
 
-  /* read all interesting keys first */
-  struct { unsigned int key; const char *name; } int_keys[] = {
-    { REGKEY_DEVENV_TOOL_host_overlay,         "DEVENV_TOOL_host_overlay" },
-    { REGKEY_DEVENV_TOOL_shell_debug,          "DEVENV_TOOL_shell_debug" },
-    { REGKEY_DEVENV_TOOL_compositor_dbg,       "DEVENV_TOOL_compositor_dbg" },
-    { REGKEY_DEVENV_TOOL_qaflag_masq,          "DEVENV_TOOL_qaflag_masq" },
-    { REGKEY_DEVENV_TOOL_trc_notify,           "DEVENV_TOOL_trc_notify" },
-    { REGKEY_DEVENV_TOOL_trc_notify_number,    "DEVENV_TOOL_trc_notify_number" },
-    { REGKEY_DEVENV_TOOL_SHELLUI_debug_menu,   "DEVENV_TOOL_SHELLUI_debug_menu" },
-    { REGKEY_DEVENV_TOOL_SHELLUI_disp_titleid, "DEVENV_TOOL_SHELLUI_disp_titleid" },
-    { REGKEY_DEVENV_TOOL_SHELLUI_content_info, "DEVENV_TOOL_SHELLUI_content_info" },
-    { REGKEY_SYSTEM_SPECIFIC_show_mode,        "SYSTEM_SPECIFIC_show_mode" },
-    { REGKEY_SYSTEM_language,                  "SYSTEM_language (reference)" },
+  /* 1. Try NonSys variants on the known keys — might bypass "entry not found" */
+  fprintf(fp, "--- NonSys READ (bypasses sys-level checks?) ---\n");
+  struct { unsigned int key; const char *name; } probe_keys[] = {
+    { REGKEY_DEVENV_TOOL_host_overlay,         "host_overlay" },
+    { REGKEY_DEVENV_TOOL_shell_debug,          "shell_debug" },
+    { REGKEY_DEVENV_TOOL_SHELLUI_debug_menu,   "SHELLUI_debug_menu" },
+    { REGKEY_DEVENV_TOOL_SHELLUI_disp_titleid, "SHELLUI_disp_titleid" },
+    { REGKEY_DEVENV_TOOL_SHELLUI_content_info, "SHELLUI_content_info" },
+    { REGKEY_DEVENV_TOOL_compositor_dbg,       "compositor_dbg" },
+    { REGKEY_SYSTEM_SPECIFIC_show_mode,        "show_mode" },
   };
-  int nkeys = sizeof(int_keys) / sizeof(int_keys[0]);
+  int nprobe = sizeof(probe_keys) / sizeof(probe_keys[0]);
 
-  fprintf(fp, "--- CURRENT VALUES ---\n");
-  for(int i = 0; i < nkeys; i++) {
-    int val = -1;
-    int err = sceRegMgrGetInt(int_keys[i].key, &val);
-    fprintf(fp, "  %-40s [0x%08x] = ", int_keys[i].name, int_keys[i].key);
-    if(err)
-      fprintf(fp, "ERR 0x%08x\n", err);
-    else
-      fprintf(fp, "%d (0x%x)\n", val, val);
-    printf("registry: %s = %s%d\n", int_keys[i].name,
-           err ? "ERR " : "", err ? err : val);
+  for(int i = 0; i < nprobe; i++) {
+    int val_sys = -1, val_nonsys = -1;
+    int err_sys = sceRegMgrGetInt(probe_keys[i].key, &val_sys);
+    int err_nonsys = sceRegMgrNonSysGetInt(probe_keys[i].key, &val_nonsys);
+    fprintf(fp, "  %-25s Sys: ", probe_keys[i].name);
+    if(err_sys) fprintf(fp, "ERR 0x%08x", err_sys);
+    else fprintf(fp, "%d", val_sys);
+    fprintf(fp, "  NonSys: ");
+    if(err_nonsys) fprintf(fp, "ERR 0x%08x", err_nonsys);
+    else fprintf(fp, "%d", val_nonsys);
+    fprintf(fp, "\n");
+    printf("registry: %s sys=%s%d nonsys=%s%d\n", probe_keys[i].name,
+           err_sys ? "E" : "", err_sys ? err_sys : val_sys,
+           err_nonsys ? "E" : "", err_nonsys ? err_nonsys : val_nonsys);
   }
+  fprintf(fp, "\n");
 
-  /* read devkitname string */
+  /* 2. Try NonSysSetInt on host_overlay — might create the entry */
+  fprintf(fp, "--- NonSys WRITE attempt ---\n");
   {
-    char devkitname[256] = {0};
-    int err = sceRegMgrGetStr(REGKEY_DEVENV_HOST_devkitname, devkitname, sizeof(devkitname));
-    fprintf(fp, "  %-40s [0x%08x] = ", "DEVENV_HOST_devkitname", REGKEY_DEVENV_HOST_devkitname);
-    if(err)
-      fprintf(fp, "ERR 0x%08x\n", err);
-    else
-      fprintf(fp, "\"%s\"\n", devkitname);
-    printf("registry: devkitname = %s\n", err ? "(error)" : devkitname);
-  }
-  fprintf(fp, "\n");
-
-  /* now try setting the devkit panel keys */
-  fprintf(fp, "--- SETTING DEVKIT PANEL KEYS ---\n");
-
-  struct { unsigned int key; const char *name; int value; } set_keys[] = {
-    { REGKEY_DEVENV_TOOL_host_overlay,         "host_overlay",      1 },
-    { REGKEY_DEVENV_TOOL_shell_debug,          "shell_debug",       1 },
-    { REGKEY_DEVENV_TOOL_SHELLUI_debug_menu,   "SHELLUI_debug_menu",1 },
-    { REGKEY_DEVENV_TOOL_SHELLUI_disp_titleid, "SHELLUI_disp_titleid",1 },
-    { REGKEY_DEVENV_TOOL_SHELLUI_content_info, "SHELLUI_content_info",1 },
-    { REGKEY_DEVENV_TOOL_trc_notify,           "trc_notify",        1 },
-    { REGKEY_DEVENV_TOOL_compositor_dbg,       "compositor_dbg",    1 },
-    { REGKEY_SYSTEM_SPECIFIC_show_mode,        "show_mode",         1 },
-  };
-  int nset = sizeof(set_keys) / sizeof(set_keys[0]);
-
-  for(int i = 0; i < nset; i++) {
-    int err = sceRegMgrSetInt(set_keys[i].key, set_keys[i].value);
-    fprintf(fp, "  SET %-30s -> %d : %s (0x%08x)\n",
-            set_keys[i].name, set_keys[i].value,
+    int err;
+    err = sceRegMgrNonSysSetInt(REGKEY_DEVENV_TOOL_host_overlay, 1);
+    fprintf(fp, "  NonSysSetInt host_overlay -> 1 : %s (0x%08x)\n",
             err ? "FAILED" : "OK", err);
-    printf("registry: SET %s -> %d : %s\n",
-           set_keys[i].name, set_keys[i].value,
-           err ? "FAILED" : "OK");
+    printf("registry: NonSysSet host_overlay -> 1 : %s\n", err ? "FAILED" : "OK");
+
+    err = sceRegMgrNonSysSetInt(REGKEY_DEVENV_TOOL_SHELLUI_debug_menu, 1);
+    fprintf(fp, "  NonSysSetInt SHELLUI_debug_menu -> 1 : %s (0x%08x)\n",
+            err ? "FAILED" : "OK", err);
+    printf("registry: NonSysSet SHELLUI_debug_menu -> 1 : %s\n", err ? "FAILED" : "OK");
+
+    err = sceRegMgrNonSysSetInt(REGKEY_DEVENV_TOOL_SHELLUI_disp_titleid, 1);
+    fprintf(fp, "  NonSysSetInt SHELLUI_disp_titleid -> 1 : %s (0x%08x)\n",
+            err ? "FAILED" : "OK", err);
+    printf("registry: NonSysSet SHELLUI_disp_titleid -> 1 : %s\n", err ? "FAILED" : "OK");
   }
   fprintf(fp, "\n");
 
-  /* verify by reading back */
-  fprintf(fp, "--- READBACK AFTER SET ---\n");
-  for(int i = 0; i < nset; i++) {
+  /* 3. Scan key range around host_overlay (0x7800A000) for FW 13.00 */
+  fprintf(fp, "--- KEY SCAN: 0x78009000 - 0x7800FFFF (step 0x100) ---\n");
+  printf("registry: scanning 0x78009000-0x7800FFFF...\n");
+  int found = 0;
+  for(unsigned int key = 0x78009000U; key <= 0x7800FFFFU; key += 0x100) {
     int val = -1;
-    int err = sceRegMgrGetInt(set_keys[i].key, &val);
-    fprintf(fp, "  %-30s = ", set_keys[i].name);
-    if(err)
-      fprintf(fp, "ERR 0x%08x\n", err);
-    else
-      fprintf(fp, "%d (0x%x)\n", val, val);
+    int err = sceRegMgrGetInt(key, &val);
+    if(!err) {
+      fprintf(fp, "  FOUND: 0x%08x = %d (0x%x)\n", key, val, val);
+      printf("registry: FOUND 0x%08x = %d\n", key, val);
+      found++;
+    }
   }
-  fprintf(fp, "\n");
 
-  fprintf(fp, "NOTE: shell restart (kill SceShellUI) may be needed for overlay to appear.\n");
-  fprintf(fp, "The devkit panel overlay shows target name, IP, and FW version on the home screen.\n");
+  /* also scan SHELLUI area (0x7800C000 - 0x7800CFFF) */
+  fprintf(fp, "\n--- KEY SCAN: 0x7800C000 - 0x7800CFFF (SHELLUI area, step 0x01) ---\n");
+  printf("registry: scanning 0x7800C000-0x7800CFFF (SHELLUI)...\n");
+  for(unsigned int key = 0x7800C000U; key <= 0x7800CFFFU; key += 1) {
+    int val = -1;
+    int err = sceRegMgrGetInt(key, &val);
+    if(!err) {
+      fprintf(fp, "  FOUND: 0x%08x = %d (0x%x)\n", key, val, val);
+      printf("registry: FOUND 0x%08x = %d\n", key, val);
+      found++;
+    }
+  }
+
+  /* scan broader DEVENV range (0x78000000 - 0x7800FFFF step 0x100) */
+  fprintf(fp, "\n--- KEY SCAN: 0x78000000 - 0x7800FFFF (full DEVENV, step 0x100) ---\n");
+  printf("registry: scanning 0x78000000-0x7800FFFF (full DEVENV)...\n");
+  for(unsigned int key = 0x78000000U; key < 0x78009000U; key += 0x100) {
+    int val = -1;
+    int err = sceRegMgrGetInt(key, &val);
+    if(!err) {
+      fprintf(fp, "  FOUND: 0x%08x = %d (0x%x)\n", key, val, val);
+      printf("registry: FOUND 0x%08x = %d\n", key, val);
+      found++;
+    }
+  }
+  for(unsigned int key = 0x78010000U; key <= 0x7802FFFFU; key += 0x100) {
+    int val = -1;
+    int err = sceRegMgrGetInt(key, &val);
+    if(!err) {
+      fprintf(fp, "  FOUND: 0x%08x = %d (0x%x)\n", key, val, val);
+      printf("registry: FOUND 0x%08x = %d\n", key, val);
+      found++;
+    }
+  }
+
+  fprintf(fp, "\nTotal keys found in DEVENV range: %d\n", found);
+  printf("registry: total DEVENV keys found: %d\n", found);
 
   fclose(fp);
   printf("wrote %s\n", path);

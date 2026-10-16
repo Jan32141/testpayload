@@ -59,6 +59,14 @@ int  sceKernelGetAslrStatus(unsigned int *);
 int  sceKernelGetBasicProductShape(unsigned int *);
 long sceKernelGetTscFrequency(void);
 int  sceKernelGetGPI(unsigned int *);
+int  sceKernelIsDevKit(void);
+int  sceKernelIsTestKit(void);
+int  sceKernelIsGenuineDevKit(void);
+int  sceKernelIsGenuineTestKit(void);
+int  sceKernelIsCEX(void);
+
+/* notification API for deep links */
+int sceNotificationSend(int userId, int isLogged, const char* payload);
 int  sceKernelGetGPO(unsigned int *);
 int  sceKernelGetSystemSwVersion(char *);
 int  sceKernelGetUpdVersion(char *);
@@ -1142,6 +1150,19 @@ enable_testkit(void) {
       fprintf(fp, "  SceShellUI not found\n");
       printf("enable_testkit: SceShellUI not found\n");
     }
+    fprintf(fp, "\n");
+  }
+
+  /* 4. Check what the system thinks we are now */
+  {
+    fprintf(fp, "--- DEVKIT DETECTION ---\n");
+    fprintf(fp, "  sceKernelIsDevKit:         %d\n", sceKernelIsDevKit());
+    fprintf(fp, "  sceKernelIsTestKit:        %d\n", sceKernelIsTestKit());
+    fprintf(fp, "  sceKernelIsCEX:            %d\n", sceKernelIsCEX());
+    fprintf(fp, "  sceKernelIsGenuineDevKit:  %d\n", sceKernelIsGenuineDevKit());
+    fprintf(fp, "  sceKernelIsGenuineTestKit: %d\n", sceKernelIsGenuineTestKit());
+    printf("enable_testkit: isDevKit=%d isTestKit=%d isCEX=%d\n",
+           sceKernelIsDevKit(), sceKernelIsTestKit(), sceKernelIsCEX());
     fprintf(fp, "\n");
   }
 

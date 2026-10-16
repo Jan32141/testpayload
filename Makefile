@@ -4,7 +4,7 @@ endif
 
 include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
 
-CFLAGS := -Wall -lkernel_sys
+CFLAGS := -Wall -lkernel_sys -lSceRegMgr
 
 ELF := testpayload.elf
 

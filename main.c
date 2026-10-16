@@ -67,6 +67,28 @@ int  sceKernelIsCEX(void);
 
 /* notification API for deep links */
 int sceNotificationSend(int userId, int isLogged, const char* payload);
+
+/* registry manager */
+int sceRegMgrGetInt(unsigned int regId, int *value);
+int sceRegMgrSetInt(unsigned int regId, int value);
+int sceRegMgrGetStr(unsigned int regId, char *buf, size_t size);
+int sceRegMgrSetStr(unsigned int regId, const char *buf, size_t size);
+
+/* DEVENV registry key IDs (from ps5-payload-dev/regdump regmgr.h) */
+#define REGKEY_DEVENV_HOST_devkitname        2013331712U
+#define REGKEY_DEVENV_TOOL_host_overlay      2013438976U
+#define REGKEY_DEVENV_TOOL_shell_debug       2013440256U
+#define REGKEY_DEVENV_TOOL_compositor_dbg    2013441280U
+#define REGKEY_DEVENV_TOOL_qaflag_masq       2013442560U
+#define REGKEY_DEVENV_TOOL_trc_notify        2013422592U
+#define REGKEY_DEVENV_TOOL_trc_notify_number 2013422848U
+#define REGKEY_DEVENV_TOOL_SHELLUI_debug_menu   2013448449U
+#define REGKEY_DEVENV_TOOL_SHELLUI_disp_titleid 2013448470U
+#define REGKEY_DEVENV_TOOL_SHELLUI_content_info 2013448648U
+#define REGKEY_SYSTEM_SPECIFIC_show_mode     42336768U
+#define REGKEY_SYSTEM_SPECIFIC_idu_mode      42336512U
+#define REGKEY_SYSTEM_language               33685504U
+
 int  sceKernelGetGPO(unsigned int *);
 int  sceKernelGetSystemSwVersion(char *);
 int  sceKernelGetUpdVersion(char *);
@@ -1170,12 +1192,117 @@ enable_testkit(void) {
   printf("wrote %s\n", path);
 }
 
+/* ========== REGISTRY APPROACH: DEVKIT PANEL ========== */
+static void
+try_registry_devkit_panel(void) {
+  FILE* fp;
+  char path[256];
+
+  snprintf(path, sizeof(path), "%s/registry_devkit.txt", OUT_DIR);
+  fp = fopen(path, "w");
+  if(!fp) { perror(path); return; }
+
+  fprintf(fp, "=== REGISTRY APPROACH: DEVKIT PANEL ===\n\n");
+  printf("registry: probing devkit panel keys...\n");
+
+  /* read all interesting keys first */
+  struct { unsigned int key; const char *name; } int_keys[] = {
+    { REGKEY_DEVENV_TOOL_host_overlay,         "DEVENV_TOOL_host_overlay" },
+    { REGKEY_DEVENV_TOOL_shell_debug,          "DEVENV_TOOL_shell_debug" },
+    { REGKEY_DEVENV_TOOL_compositor_dbg,       "DEVENV_TOOL_compositor_dbg" },
+    { REGKEY_DEVENV_TOOL_qaflag_masq,          "DEVENV_TOOL_qaflag_masq" },
+    { REGKEY_DEVENV_TOOL_trc_notify,           "DEVENV_TOOL_trc_notify" },
+    { REGKEY_DEVENV_TOOL_trc_notify_number,    "DEVENV_TOOL_trc_notify_number" },
+    { REGKEY_DEVENV_TOOL_SHELLUI_debug_menu,   "DEVENV_TOOL_SHELLUI_debug_menu" },
+    { REGKEY_DEVENV_TOOL_SHELLUI_disp_titleid, "DEVENV_TOOL_SHELLUI_disp_titleid" },
+    { REGKEY_DEVENV_TOOL_SHELLUI_content_info, "DEVENV_TOOL_SHELLUI_content_info" },
+    { REGKEY_SYSTEM_SPECIFIC_show_mode,        "SYSTEM_SPECIFIC_show_mode" },
+    { REGKEY_SYSTEM_SPECIFIC_idu_mode,         "SYSTEM_SPECIFIC_idu_mode" },
+    { REGKEY_SYSTEM_language,                  "SYSTEM_language (reference)" },
+  };
+  int nkeys = sizeof(int_keys) / sizeof(int_keys[0]);
+
+  fprintf(fp, "--- CURRENT VALUES ---\n");
+  for(int i = 0; i < nkeys; i++) {
+    int val = -1;
+    int err = sceRegMgrGetInt(int_keys[i].key, &val);
+    fprintf(fp, "  %-40s [0x%08x] = ", int_keys[i].name, int_keys[i].key);
+    if(err)
+      fprintf(fp, "ERR 0x%08x\n", err);
+    else
+      fprintf(fp, "%d (0x%x)\n", val, val);
+    printf("registry: %s = %s%d\n", int_keys[i].name,
+           err ? "ERR " : "", err ? err : val);
+  }
+
+  /* read devkitname string */
+  {
+    char devkitname[256] = {0};
+    int err = sceRegMgrGetStr(REGKEY_DEVENV_HOST_devkitname, devkitname, sizeof(devkitname));
+    fprintf(fp, "  %-40s [0x%08x] = ", "DEVENV_HOST_devkitname", REGKEY_DEVENV_HOST_devkitname);
+    if(err)
+      fprintf(fp, "ERR 0x%08x\n", err);
+    else
+      fprintf(fp, "\"%s\"\n", devkitname);
+    printf("registry: devkitname = %s\n", err ? "(error)" : devkitname);
+  }
+  fprintf(fp, "\n");
+
+  /* now try setting the devkit panel keys */
+  fprintf(fp, "--- SETTING DEVKIT PANEL KEYS ---\n");
+
+  struct { unsigned int key; const char *name; int value; } set_keys[] = {
+    { REGKEY_DEVENV_TOOL_host_overlay,         "host_overlay",      1 },
+    { REGKEY_DEVENV_TOOL_shell_debug,          "shell_debug",       1 },
+    { REGKEY_DEVENV_TOOL_SHELLUI_debug_menu,   "SHELLUI_debug_menu",1 },
+    { REGKEY_DEVENV_TOOL_SHELLUI_disp_titleid, "SHELLUI_disp_titleid",1 },
+    { REGKEY_DEVENV_TOOL_SHELLUI_content_info, "SHELLUI_content_info",1 },
+    { REGKEY_DEVENV_TOOL_trc_notify,           "trc_notify",        1 },
+    { REGKEY_DEVENV_TOOL_compositor_dbg,       "compositor_dbg",    1 },
+    { REGKEY_SYSTEM_SPECIFIC_show_mode,        "show_mode",         1 },
+  };
+  int nset = sizeof(set_keys) / sizeof(set_keys[0]);
+
+  for(int i = 0; i < nset; i++) {
+    int err = sceRegMgrSetInt(set_keys[i].key, set_keys[i].value);
+    fprintf(fp, "  SET %-30s -> %d : %s (0x%08x)\n",
+            set_keys[i].name, set_keys[i].value,
+            err ? "FAILED" : "OK", err);
+    printf("registry: SET %s -> %d : %s\n",
+           set_keys[i].name, set_keys[i].value,
+           err ? "FAILED" : "OK");
+  }
+  fprintf(fp, "\n");
+
+  /* verify by reading back */
+  fprintf(fp, "--- READBACK AFTER SET ---\n");
+  for(int i = 0; i < nset; i++) {
+    int val = -1;
+    int err = sceRegMgrGetInt(set_keys[i].key, &val);
+    fprintf(fp, "  %-30s = ", set_keys[i].name);
+    if(err)
+      fprintf(fp, "ERR 0x%08x\n", err);
+    else
+      fprintf(fp, "%d (0x%x)\n", val, val);
+  }
+  fprintf(fp, "\n");
+
+  fprintf(fp, "NOTE: shell restart (kill SceShellUI) may be needed for overlay to appear.\n");
+  fprintf(fp, "The devkit panel overlay shows target name, IP, and FW version on the home screen.\n");
+
+  fclose(fp);
+  printf("wrote %s\n", path);
+}
+
 int
 main(void) {
   mkdir(OUT_DIR, 0777);
 
   /* enable testkit flags first, then dump everything (so dumps reflect new state) */
   enable_testkit();
+
+  /* try registry approach for devkit panel overlay */
+  try_registry_devkit_panel();
 
   write_flags();
   write_struct_dumps();

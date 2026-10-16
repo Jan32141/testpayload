@@ -20,6 +20,10 @@ extern const unsigned long KERNEL_OFFSET_VMSPACE_P_ROOT;
 extern const unsigned long KERNEL_OFFSET_UCRED_CR_SVGID;
 extern const unsigned long KERNEL_OFFSET_UCRED_CR_PRISON;
 
+/* IOMMU DMA write functions — bypass CPU page protections (FW >= 7.00) */
+int kernel_iommu_copyin(const void *uaddr, unsigned long kaddr, unsigned long len);
+int kernel_iommu_setchar(unsigned long kaddr, unsigned char val);
+
 /* ---- SCE syscalls ---- */
 typedef struct notify_request {
   char unused[45];
@@ -949,19 +953,60 @@ enable_testkit(void) {
 
   fprintf(fp, "=== ENABLE DEVKIT/TESTKIT FLAGS ===\n\n");
 
-  /* TARGETID, SECURITY_FLAGS, UTOKEN_FLAGS are HV-protected.
-     kernel_setchar() on them causes a kernel panic even in a fork.
-     We only READ them here. To write them, bypervisor must be run first
-     and a separate HV-aware payload is needed. */
+  /* TARGETID, SECURITY_FLAGS, UTOKEN_FLAGS are on a read-only kernel page.
+     kernel_setchar() uses pipe-based writes which trigger a page fault panic.
+     kernel_iommu_setchar() writes via IOMMU DMA, bypassing CPU page protections. */
+
+  /* 0. SECURITY_FLAGS — enable debug/devkit bits via IOMMU */
   {
     uint8_t sf = kernel_getchar(KERNEL_ADDRESS_SECURITY_FLAGS);
+    fprintf(fp, "SECURITY_FLAGS before: 0x%02x\n", sf);
+
+    uint8_t sf_new = sf | (1<<0)|(1<<2)|(1<<3)|(1<<5)|(1<<6)|(1<<7);
+    if(kernel_iommu_setchar(KERNEL_ADDRESS_SECURITY_FLAGS, sf_new)) {
+      fprintf(fp, "  FAILED (IOMMU write)\n");
+      printf("enable_testkit: SECURITY_FLAGS IOMMU write failed\n");
+    } else {
+      uint8_t sf_after = kernel_getchar(KERNEL_ADDRESS_SECURITY_FLAGS);
+      fprintf(fp, "SECURITY_FLAGS after:  0x%02x\n", sf_after);
+      fprintf(fp, "  SET OK via IOMMU DMA\n");
+      printf("enable_testkit: SECURITY_FLAGS -> 0x%02x\n", sf_after);
+    }
+    fprintf(fp, "\n");
+  }
+
+  /* 0b. UTOKEN_FLAGS — enable all via IOMMU */
+  {
     uint8_t ut = kernel_getchar(KERNEL_ADDRESS_UTOKEN_FLAGS);
+    fprintf(fp, "UTOKEN_FLAGS before: 0x%02x\n", ut);
+
+    if(kernel_iommu_setchar(KERNEL_ADDRESS_UTOKEN_FLAGS, 0xff)) {
+      fprintf(fp, "  FAILED (IOMMU write)\n");
+      printf("enable_testkit: UTOKEN_FLAGS IOMMU write failed\n");
+    } else {
+      uint8_t ut_after = kernel_getchar(KERNEL_ADDRESS_UTOKEN_FLAGS);
+      fprintf(fp, "UTOKEN_FLAGS after:  0x%02x\n", ut_after);
+      fprintf(fp, "  SET OK via IOMMU DMA\n");
+      printf("enable_testkit: UTOKEN_FLAGS -> 0x%02x\n", ut_after);
+    }
+    fprintf(fp, "\n");
+  }
+
+  /* 0c. TARGETID — set to DEVKIT (0x02) for devkit panel via IOMMU */
+  {
     uint8_t tid = kernel_getchar(KERNEL_ADDRESS_TARGETID);
-    fprintf(fp, "SECURITY_FLAGS: 0x%02x (HV-protected, read-only)\n", sf);
-    fprintf(fp, "UTOKEN_FLAGS:   0x%02x (HV-protected, read-only)\n", ut);
-    fprintf(fp, "TARGETID:       0x%02x = %s (HV-protected, read-only)\n", tid, targetid_name(tid));
-    fprintf(fp, "  -> to enable devkit panel: run bypervisor first,\n");
-    fprintf(fp, "     then use an HV-level payload to write these flags\n\n");
+    fprintf(fp, "TARGETID before: 0x%02x = %s\n", tid, targetid_name(tid));
+
+    if(kernel_iommu_setchar(KERNEL_ADDRESS_TARGETID, 0x02)) {
+      fprintf(fp, "  FAILED (IOMMU write)\n");
+      printf("enable_testkit: TARGETID IOMMU write failed\n");
+    } else {
+      uint8_t tid_after = kernel_getchar(KERNEL_ADDRESS_TARGETID);
+      fprintf(fp, "TARGETID after:  0x%02x = %s\n", tid_after, targetid_name(tid_after));
+      fprintf(fp, "  SET OK via IOMMU DMA\n");
+      printf("enable_testkit: TARGETID -> 0x%02x\n", tid_after);
+    }
+    fprintf(fp, "\n");
   }
 
   /* 1. QA FLAGS — enable testkit-relevant bits (safe via SDK function) */

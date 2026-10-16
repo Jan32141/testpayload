@@ -1,30 +1,21 @@
-/* PS5 payload: comprehensive offset and system info dump to /data/testpayload/
+/* PS5 payload: decode and print every flag that is set.
  * Build with the ps5-payload-sdk. */
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/sysctl.h>
 #include <unistd.h>
 
 #include <ps5/kernel.h>
 #include <ps5/payload.h>
 
 #define OUT_DIR  "/data/testpayload"
-
-/* ---- CRT-internal symbols ---- */
-extern const unsigned long KERNEL_ADDRESS_DMAP_BASE;
-extern const unsigned long KERNEL_ADDRESS_IOMMU_SOFTC;
-extern const unsigned long KERNEL_OFFSET_VMSPACE_P_ROOT;
-extern const unsigned long KERNEL_OFFSET_UCRED_CR_SVGID;
-extern const unsigned long KERNEL_OFFSET_UCRED_CR_PRISON;
+#define OUT_FILE OUT_DIR "/flags.txt"
 
 /* ---- SCE syscalls ---- */
 typedef struct notify_request {
   char unused[45];
   char message[3075];
 } notify_request_t;
-
 int sceKernelSendNotificationRequest(int, notify_request_t*, size_t, int);
 
 typedef struct app_info {
@@ -33,41 +24,12 @@ typedef struct app_info {
   char     title_id[14];
   char     unknown2[0x3c];
 } app_info_t;
+int sceKernelGetAppInfo(pid_t pid, app_info_t *info);
+int sceKernelGetSafemode(unsigned int *);
+int sceKernelGetAslrStatus(unsigned int *);
+int sceKernelGetGPI(unsigned int *);
+int sceKernelGetGPO(unsigned int *);
 
-int  sceKernelGetAppInfo(pid_t pid, app_info_t *info);
-int  sceKernelGetHwModelName(char *);
-int  sceKernelGetHwSerialNumber(char *);
-long sceKernelGetCpuFrequency(void);
-int  sceKernelGetCpuTemperature(int *);
-int  sceKernelGetSocSensorTemperature(int, int *);
-int  sceKernelGetSocPowerConsumption(int *);
-
-/* system info */
-int  sceKernelGetProsperoSystemSwVersion(unsigned int *);
-int  sceKernelGetOpenPsId(char[16]);
-int  sceKernelGetProductCode(unsigned int *);
-int  sceKernelGetProductStr(char *);
-int  sceKernelGetMainSocId(char[8]);
-int  sceKernelGetSubsysId(unsigned int *);
-int  sceKernelGetDirectMemorySize(size_t *);
-int  sceKernelGetPhysPageSize(void);
-int  sceKernelGetCurrentCpu(void);
-int  sceKernelGetProcessName(pid_t, char *);
-int  sceKernelGetProcessType(pid_t, unsigned int *);
-int  sceKernelGetSafemode(unsigned int *);
-int  sceKernelGetAslrStatus(unsigned int *);
-int  sceKernelGetBasicProductShape(unsigned int *);
-long sceKernelGetTscFrequency(void);
-int  sceKernelGetGPI(unsigned int *);
-int  sceKernelGetGPO(unsigned int *);
-int  sceKernelGetSystemSwVersion(char *);
-int  sceKernelGetUpdVersion(char *);
-
-/* dynlib */
-int  sceKernelGetModuleList(int *, size_t);
-int  sceKernelGetModuleInfo(int, void *);
-
-/* ---- helpers ---- */
 static void
 notify(const char* msg) {
   notify_request_t req;
@@ -77,481 +39,390 @@ notify(const char* msg) {
 }
 
 static void
-hex_string(const uint8_t* bin, char* hex, size_t len) {
-  hex[0] = '0'; hex[1] = 'x';
+print_bits(FILE* fp, const char* label, const uint8_t* data, size_t len) {
+  fprintf(fp, "  raw: 0x");
   for(size_t i = 0; i < len; i++)
-    sprintf(&hex[i*2 + 2], "%02x", bin[i]);
-  hex[len*2 + 2] = '\0';
+    fprintf(fp, "%02x", data[i]);
+  fprintf(fp, "\n");
+
+  int any = 0;
+  for(size_t i = 0; i < len; i++) {
+    for(int b = 7; b >= 0; b--) {
+      if(data[i] & (1 << b)) {
+        fprintf(fp, "  [%s bit %zu] = 1\n", label, i * 8 + (7 - b));
+        any = 1;
+      }
+    }
+  }
+  if(!any)
+    fprintf(fp, "  (no bits set)\n");
 }
 
-/* ---- offset dump ---- */
+/* ---- known bit meanings ---- */
+
+/* security_flags byte at SECURITY_FLAGS+0x00 */
+static const char* secflag_names[8] = {
+  /* bit 0 */ "DEBUG_SETTING_MODE (debug settings enabled)",
+  /* bit 1 */ "SYSTEM_INIT_DONE",
+  /* bit 2 */ "ALLOW_UNSIGNED_CODE",
+  /* bit 3 */ "ALLOW_MAPPED_WRITE_EXEC",
+  /* bit 4 */ "ALLOW_UNVERIFIED_DISC",
+  /* bit 5 */ "INTERNAL_PROCESS_MODE",
+  /* bit 6 */ "ALLOW_DEBUG_PROCESSES",
+  /* bit 7 */ "DEVKIT_MODE",
+};
+
+/* target ID values */
+static const char*
+targetid_name(uint8_t id) {
+  switch(id) {
+  case 0x00: return "UNKNOWN";
+  case 0x01: return "RETAIL (CEX)";
+  case 0x02: return "DEVKIT (DEX/TOOL)";
+  case 0x82: return "TESTKIT (TESTING)";
+  case 0x81: return "ARCADE";
+  case 0xFF: return "AEOLIA (EMU)";
+  default:   return "(unknown target)";
+  }
+}
+
+/* QA flags: 16 bytes (128 bits) */
+static const char* qaflags_names[] = {
+  /* byte 0 */
+  /* 0.0 */ "INTERNAL_DEV",
+  /* 0.1 */ "QA_ENABLED",
+  /* 0.2 */ "ALLOW_DEBUG_MENU",
+  /* 0.3 */ "ALLOW_PS_BUTTON_POWER_OFF",
+  /* 0.4 */ "ALLOW_FACTORY_RESET",
+  /* 0.5 */ "ALLOW_USB_MASS_STORAGE",
+  /* 0.6 */ "ALLOW_HOST_FS",
+  /* 0.7 */ "ALLOW_UPDATE_FROM_USB",
+  /* byte 1 */
+  /* 1.0 */ "ALLOW_EXTERNAL_HDD_WITHOUT_FORMAT",
+  /* 1.1 */ "ALLOW_UNFORMATTED_EXTERNAL_HDD",
+  /* 1.2 */ "ALLOW_UPDATE_RETAIL_TO_DEVKIT",
+  /* 1.3 */ "FAKE_FINALIZE",
+  /* 1.4 */ "ALLOW_INSTALLATION_FROM_HOST",
+  /* 1.5 */ "UNKOWN_1_5",
+  /* 1.6 */ "UNKOWN_1_6",
+  /* 1.7 */ "UNKOWN_1_7",
+  /* byte 2 */
+  /* 2.0 */ "ENABLE_TESTKIT_FEATURES",
+  /* 2.1 */ "ENABLE_NP_ENV_SWITCHING",
+  /* 2.2 */ "ENABLE_STORE_MODE",
+  /* 2.3 */ "ENABLE_KIOSK_MODE",
+  /* 2.4 */ "ENABLE_PSN_ACCESS_TRACE_LOG",
+  /* 2.5 */ "UNKOWN_2_5",
+  /* 2.6 */ "UNKOWN_2_6",
+  /* 2.7 */ "UNKOWN_2_7",
+  /* byte 3 */
+  /* 3.0 */ "ALLOW_SAVEDATA_REPAIR",
+  /* 3.1 */ "ALLOW_DISC_BUDGETTYPE",
+  /* 3.2 */ "ALLOW_SYSTEM_LEVEL_DEBUGGER",
+  /* 3.3 */ "ALLOW_MBUS_MONITOR",
+  /* 3.4 */ "UNKOWN_3_4",
+  /* 3.5 */ "UNKOWN_3_5",
+  /* 3.6 */ "UNKOWN_3_6",
+  /* 3.7 */ "UNKOWN_3_7",
+};
+
+/* SCE caps: 16 bytes (128 bits) - known capability flags */
+static const char* scecaps_names[] = {
+  /* byte 0 */
+  /* 0.0 */ "PRIV_MAXFILES",
+  /* 0.1 */ "PRIV_PROC_SETLOGIN",
+  /* 0.2 */ "PRIV_MDBG",
+  /* 0.3 */ "PRIV_PROCESS_JIT",
+  /* 0.4 */ "PRIV_RANDOM_MMAP",
+  /* 0.5 */ "PRIV_PTRACE",
+  /* 0.6 */ "PRIV_VFS_READ",
+  /* 0.7 */ "PRIV_VFS_WRITE",
+  /* byte 1 */
+  /* 1.0 */ "PRIV_SYSCTL_WR",
+  /* 1.1 */ "PRIV_DRIVER_DEBUG",
+  /* 1.2 */ "PRIV_JAIL_MOUNT",
+  /* 1.3 */ "PRIV_DEBUG_ATTACH",
+  /* 1.4 */ "PRIV_DEBUG_UNPRIVILEGED",
+  /* 1.5 */ "PRIV_COREDUMP",
+  /* 1.6 */ "PRIV_SCE_SYS",
+  /* 1.7 */ "PRIV_SYSTEM_DYNLIB",
+  /* byte 2 */
+  /* 2.0 */ "PRIV_MOUNT",
+  /* 2.1 */ "PRIV_UNMOUNT",
+  /* 2.2 */ "PRIV_NFS",
+  /* 2.3 */ "PRIV_KLD_LOAD",
+  /* 2.4 */ "PRIV_DIRECT_MEM",
+  /* 2.5 */ "PRIV_GPU_MAP",
+  /* 2.6 */ "PRIV_NET_RAW",
+  /* 2.7 */ "PRIV_NET_IFCONFIG",
+};
+
+/* SCE attrs: 32 bytes (256 bits) - known attribute flags */
+static const char* sceattrs_names[] = {
+  /* byte 0 */
+  /* 0.0 */ "ATTR_IS_SYSTEM_PROCESS",
+  /* 0.1 */ "ATTR_IS_DAEMON",
+  /* 0.2 */ "ATTR_IS_DEBUGGABLE",
+  /* 0.3 */ "ATTR_IS_GAME",
+  /* 0.4 */ "ATTR_HAS_DYNAMIC_PRIORITY",
+  /* 0.5 */ "ATTR_IS_VIDEOPLAYER",
+  /* 0.6 */ "ATTR_HAS_USE_VIDEO_SERVICE",
+  /* 0.7 */ "ATTR_HAS_USE_AUDIO_SERVICE",
+};
+
 static void
-write_offsets(void) {
+print_named_bits(FILE* fp, const uint8_t* data, size_t datalen,
+                 const char** names, size_t nnames) {
+  fprintf(fp, "  raw: 0x");
+  for(size_t i = 0; i < datalen; i++)
+    fprintf(fp, "%02x", data[i]);
+  fprintf(fp, "\n");
+
+  int any = 0;
+  for(size_t i = 0; i < datalen; i++) {
+    for(int b = 7; b >= 0; b--) {
+      if(data[i] & (1 << b)) {
+        size_t bitidx = i * 8 + (7 - b);
+        if(bitidx < nnames && names[bitidx])
+          fprintf(fp, "  [bit %3zu] SET  %s\n", bitidx, names[bitidx]);
+        else
+          fprintf(fp, "  [bit %3zu] SET  (unknown)\n", bitidx);
+        any = 1;
+      }
+    }
+  }
+  if(!any)
+    fprintf(fp, "  (no bits set)\n");
+}
+
+int
+main(void) {
   FILE* fp;
-  char path[256];
+  pid_t pid = getpid();
   uint32_t fw = kernel_get_fw_version();
 
-  snprintf(path, sizeof(path), "%s/offsets.txt", OUT_DIR);
-  fp = fopen(path, "w");
-  if(!fp) { perror(path); return; }
+  mkdir(OUT_DIR, 0777);
 
-  fprintf(fp, "fw_version: 0x%08x\n\n", fw);
-
-  fprintf(fp, "# absolute kernel addresses\n");
-  fprintf(fp, "KERNEL_ADDRESS_TEXT_BASE         0x%lx\n", KERNEL_ADDRESS_TEXT_BASE);
-  fprintf(fp, "KERNEL_ADDRESS_DATA_BASE         0x%lx\n", KERNEL_ADDRESS_DATA_BASE);
-  fprintf(fp, "KERNEL_ADDRESS_DMAP_BASE         0x%lx\n", KERNEL_ADDRESS_DMAP_BASE);
-  fprintf(fp, "KERNEL_ADDRESS_ALLPROC           0x%lx\n", KERNEL_ADDRESS_ALLPROC);
-  fprintf(fp, "KERNEL_ADDRESS_PRISON0           0x%lx\n", KERNEL_ADDRESS_PRISON0);
-  fprintf(fp, "KERNEL_ADDRESS_ROOTVNODE         0x%lx\n", KERNEL_ADDRESS_ROOTVNODE);
-  fprintf(fp, "KERNEL_ADDRESS_SECURITY_FLAGS    0x%lx\n", KERNEL_ADDRESS_SECURITY_FLAGS);
-  fprintf(fp, "KERNEL_ADDRESS_UTOKEN_FLAGS      0x%lx\n", KERNEL_ADDRESS_UTOKEN_FLAGS);
-  fprintf(fp, "KERNEL_ADDRESS_QA_FLAGS          0x%lx\n", KERNEL_ADDRESS_QA_FLAGS);
-  fprintf(fp, "KERNEL_ADDRESS_TARGETID          0x%lx\n", KERNEL_ADDRESS_TARGETID);
-  fprintf(fp, "KERNEL_ADDRESS_BUS_DATA_DEVICES  0x%lx\n", KERNEL_ADDRESS_BUS_DATA_DEVICES);
-  fprintf(fp, "KERNEL_ADDRESS_IOMMU_SOFTC       0x%lx\n", KERNEL_ADDRESS_IOMMU_SOFTC);
-
-  fprintf(fp, "\n# struct proc field offsets\n");
-  fprintf(fp, "KERNEL_OFFSET_PROC_P_UCRED       0x%lx\n", KERNEL_OFFSET_PROC_P_UCRED);
-  fprintf(fp, "KERNEL_OFFSET_PROC_P_FD          0x%lx\n", KERNEL_OFFSET_PROC_P_FD);
-  fprintf(fp, "KERNEL_OFFSET_PROC_P_PID         0x%lx\n", KERNEL_OFFSET_PROC_P_PID);
-  fprintf(fp, "KERNEL_OFFSET_PROC_P_VMSPACE     0x%lx\n", KERNEL_OFFSET_PROC_P_VMSPACE);
-
-  fprintf(fp, "\n# struct ucred field offsets\n");
-  fprintf(fp, "KERNEL_OFFSET_UCRED_CR_UID       0x%lx\n", KERNEL_OFFSET_UCRED_CR_UID);
-  fprintf(fp, "KERNEL_OFFSET_UCRED_CR_RUID      0x%lx\n", KERNEL_OFFSET_UCRED_CR_RUID);
-  fprintf(fp, "KERNEL_OFFSET_UCRED_CR_SVUID     0x%lx\n", KERNEL_OFFSET_UCRED_CR_SVUID);
-  fprintf(fp, "KERNEL_OFFSET_UCRED_CR_RGID      0x%lx\n", KERNEL_OFFSET_UCRED_CR_RGID);
-  fprintf(fp, "KERNEL_OFFSET_UCRED_CR_SVGID     0x%lx\n", KERNEL_OFFSET_UCRED_CR_SVGID);
-  fprintf(fp, "KERNEL_OFFSET_UCRED_CR_PRISON    0x%lx\n", KERNEL_OFFSET_UCRED_CR_PRISON);
-  fprintf(fp, "KERNEL_OFFSET_UCRED_CR_SCEAUTHID 0x%lx\n", KERNEL_OFFSET_UCRED_CR_SCEAUTHID);
-  fprintf(fp, "KERNEL_OFFSET_UCRED_CR_SCECAPS   0x%lx\n", KERNEL_OFFSET_UCRED_CR_SCECAPS);
-  fprintf(fp, "KERNEL_OFFSET_UCRED_CR_SCEATTRS  0x%lx\n", KERNEL_OFFSET_UCRED_CR_SCEATTRS);
-
-  fprintf(fp, "\n# struct filedesc field offsets\n");
-  fprintf(fp, "KERNEL_OFFSET_FILEDESC_FD_RDIR   0x%lx\n", KERNEL_OFFSET_FILEDESC_FD_RDIR);
-  fprintf(fp, "KERNEL_OFFSET_FILEDESC_FD_JDIR   0x%lx\n", KERNEL_OFFSET_FILEDESC_FD_JDIR);
-
-  fprintf(fp, "\n# struct vmspace field offsets\n");
-  fprintf(fp, "KERNEL_OFFSET_VMSPACE_VM_PMAP    0x%lx\n", KERNEL_OFFSET_VMSPACE_VM_PMAP);
-  fprintf(fp, "KERNEL_OFFSET_VMSPACE_P_ROOT     0x%lx\n", KERNEL_OFFSET_VMSPACE_P_ROOT);
-
-  /* computed offsets: SECURITY_FLAGS relative fields */
-  fprintf(fp, "\n# computed (relative to SECURITY_FLAGS)\n");
-  fprintf(fp, "TARGETID_OFFSET_FROM_SECFLAGS    0x09\n");
-  fprintf(fp, "QA_FLAGS_OFFSET_FROM_SECFLAGS    0x24\n");
-  fprintf(fp, "UTOKEN_FLAGS_OFFSET_FROM_SECFLAGS 0x8c\n");
-
-  /* text-to-data delta */
-  fprintf(fp, "\n# deltas\n");
-  if(KERNEL_ADDRESS_TEXT_BASE && KERNEL_ADDRESS_DATA_BASE) {
-    fprintf(fp, "TEXT_TO_DATA_DELTA               0x%lx\n",
-            KERNEL_ADDRESS_DATA_BASE - KERNEL_ADDRESS_TEXT_BASE);
-  }
-  if(KERNEL_ADDRESS_DATA_BASE && KERNEL_ADDRESS_ALLPROC) {
-    fprintf(fp, "DATA_TO_ALLPROC_DELTA            0x%lx\n",
-            KERNEL_ADDRESS_ALLPROC - KERNEL_ADDRESS_DATA_BASE);
-  }
-  if(KERNEL_ADDRESS_DATA_BASE && KERNEL_ADDRESS_ROOTVNODE) {
-    fprintf(fp, "DATA_TO_ROOTVNODE_DELTA          0x%lx\n",
-            KERNEL_ADDRESS_ROOTVNODE - KERNEL_ADDRESS_DATA_BASE);
-  }
-  if(KERNEL_ADDRESS_DATA_BASE && KERNEL_ADDRESS_SECURITY_FLAGS) {
-    fprintf(fp, "DATA_TO_SECFLAGS_DELTA           0x%lx\n",
-            KERNEL_ADDRESS_SECURITY_FLAGS - KERNEL_ADDRESS_DATA_BASE);
-  }
-  if(KERNEL_ADDRESS_DATA_BASE && KERNEL_ADDRESS_BUS_DATA_DEVICES) {
-    fprintf(fp, "DATA_TO_BUS_DATA_DEVICES_DELTA   0x%lx\n",
-            KERNEL_ADDRESS_BUS_DATA_DEVICES - KERNEL_ADDRESS_DATA_BASE);
+  fp = fopen(OUT_FILE, "w");
+  if(!fp) {
+    perror(OUT_FILE);
+    notify("testpayload: failed to open " OUT_FILE);
+    return 1;
   }
 
-  fclose(fp);
-  printf("wrote %s\n", path);
-}
+  fprintf(fp, "=== PS5 FLAGS DUMP ===\n");
+  fprintf(fp, "fw_version: 0x%08x (%d.%02d-%03d.%03d)\n\n",
+          fw,
+          (fw >> 24) & 0xff, (fw >> 16) & 0xff,
+          (fw >> 8) & 0xff, fw & 0xff);
 
-/* ---- runtime credential & proc dump ---- */
-static void
-write_runtime(void) {
-  FILE* fp;
-  char path[256];
-  pid_t pid = getpid();
-  uint8_t caps[16] = {0};
-  uint8_t attrs[32] = {0};
-  uint8_t qaflags[16] = {0};
-  char hex[128];
-  app_info_t app = {0};
-
-  snprintf(path, sizeof(path), "%s/runtime.txt", OUT_DIR);
-  fp = fopen(path, "w");
-  if(!fp) { perror(path); return; }
-
-  fprintf(fp, "# runtime values for pid %d\n\n", pid);
-
-  /* firmware & console flags read from kernel memory */
-  fprintf(fp, "fw_version:      0x%08x\n", kernel_get_fw_version());
-  fprintf(fp, "TARGETID:        0x%02x\n",
-          kernel_getchar(KERNEL_ADDRESS_TARGETID));
-  fprintf(fp, "SECURITY_FLAGS:  0x%02x\n",
-          kernel_getchar(KERNEL_ADDRESS_SECURITY_FLAGS));
-  fprintf(fp, "UTOKEN_FLAGS:    0x%02x\n",
-          kernel_getchar(KERNEL_ADDRESS_UTOKEN_FLAGS));
-
-  kernel_get_qaflags(qaflags);
-  hex_string(qaflags, hex, sizeof(qaflags));
-  fprintf(fp, "QA_FLAGS:        %s\n", hex);
-
-  /* ucred info */
-  fprintf(fp, "\n# ucred\n");
-  fprintf(fp, "uid:             %d\n", kernel_get_ucred_uid(pid));
-  fprintf(fp, "ruid:            %d\n", kernel_get_ucred_ruid(pid));
-  fprintf(fp, "svuid:           %d\n", kernel_get_ucred_svuid(pid));
-  fprintf(fp, "rgid:            %d\n", kernel_get_ucred_rgid(pid));
-  fprintf(fp, "svgid:           %d\n", kernel_get_ucred_svgid(pid));
-  fprintf(fp, "authid:          0x%016lx\n", kernel_get_ucred_authid(pid));
-  fprintf(fp, "prison:          0x%lx\n", kernel_get_ucred_prison(pid));
-
-  kernel_get_ucred_caps(pid, caps);
-  hex_string(caps, hex, sizeof(caps));
-  fprintf(fp, "caps:            %s\n", hex);
-
-  kernel_get_ucred_attrs(pid, attrs);
-  hex_string(attrs, hex, sizeof(attrs));
-  fprintf(fp, "attrs:           %s\n", hex);
-
-  /* proc pointers */
-  fprintf(fp, "\n# proc\n");
-  fprintf(fp, "proc:            0x%lx\n", kernel_get_proc(pid));
-  fprintf(fp, "proc_ucred:      0x%lx\n", kernel_get_proc_ucred(pid));
-  fprintf(fp, "proc_filedesc:   0x%lx\n", kernel_get_proc_filedesc(pid));
-  fprintf(fp, "proc_rootdir:    0x%lx\n", kernel_get_proc_rootdir(pid));
-  fprintf(fp, "proc_jaildir:    0x%lx\n", kernel_get_proc_jaildir(pid));
-  fprintf(fp, "root_vnode:      0x%lx\n", kernel_get_root_vnode());
-
-  /* app info */
-  if(!sceKernelGetAppInfo(pid, &app)) {
-    fprintf(fp, "\n# app info\n");
-    fprintf(fp, "app_id:          %u\n", app.app_id);
-    fprintf(fp, "title_id:        %s\n", app.title_id);
-  }
-
-  /* read first 8 bytes at SECURITY_FLAGS for the full flags block */
+  /* ---- SECURITY_FLAGS ---- */
   {
-    uint64_t secflags_qword = 0;
-    if(!kernel_copyout(KERNEL_ADDRESS_SECURITY_FLAGS, &secflags_qword, 8)) {
-      fprintf(fp, "\n# SECURITY_FLAGS raw qword\n");
-      fprintf(fp, "secflags_raw:    0x%016lx\n", secflags_qword);
+    uint8_t sf = kernel_getchar(KERNEL_ADDRESS_SECURITY_FLAGS);
+    fprintf(fp, "--- SECURITY_FLAGS (@ 0x%lx) ---\n", KERNEL_ADDRESS_SECURITY_FLAGS);
+    fprintf(fp, "  raw: 0x%02x\n", sf);
+    for(int b = 0; b < 8; b++) {
+      fprintf(fp, "  [bit %d] %s  %s\n",
+              b,
+              (sf & (1 << b)) ? "SET  " : "CLEAR",
+              secflag_names[b]);
     }
+    fprintf(fp, "\n");
   }
 
-  fclose(fp);
-  printf("wrote %s\n", path);
-}
-
-/* ---- hardware info ---- */
-static void
-write_hwinfo(void) {
-  FILE* fp;
-  char path[256];
-  char buf[1000];
-  int temp = 0;
-  int power = 0;
-  unsigned int val = 0;
-
-  snprintf(path, sizeof(path), "%s/hwinfo.txt", OUT_DIR);
-  fp = fopen(path, "w");
-  if(!fp) { perror(path); return; }
-
-  fprintf(fp, "# hardware info\n\n");
-
-  buf[0] = '\0';
-  if(!sceKernelGetHwModelName(buf))
-    fprintf(fp, "model:           %s\n", buf);
-
-  if(!sceKernelGetSocSensorTemperature(0, &temp))
-    fprintf(fp, "soc_temp:        %d C\n", temp);
-
-  if(!sceKernelGetCpuTemperature(&temp))
-    fprintf(fp, "cpu_temp:        %d C\n", temp);
-
-  fprintf(fp, "cpu_freq:        %ld MHz\n",
-          sceKernelGetCpuFrequency() / (1000*1000));
-
-  if(!sceKernelGetSocPowerConsumption(&power))
-    fprintf(fp, "soc_power:       %d mW\n", power);
-
-  fprintf(fp, "tsc_freq:        %ld Hz\n", sceKernelGetTscFrequency());
-  fprintf(fp, "current_cpu:     %d\n", sceKernelGetCurrentCpu());
-  fprintf(fp, "phys_page_size:  %d\n", sceKernelGetPhysPageSize());
-
-  if(!sceKernelGetProductCode(&val))
-    fprintf(fp, "product_code:    0x%08x\n", val);
-
-  buf[0] = '\0';
-  if(!sceKernelGetProductStr(buf))
-    fprintf(fp, "product_str:     %s\n", buf);
-
-  if(!sceKernelGetBasicProductShape(&val))
-    fprintf(fp, "product_shape:   0x%x\n", val);
-
-  if(!sceKernelGetSafemode(&val))
-    fprintf(fp, "safemode:        %u\n", val);
-
-  if(!sceKernelGetAslrStatus(&val))
-    fprintf(fp, "aslr_status:     %u\n", val);
-
+  /* ---- Extended SECURITY_FLAGS region (bytes 0x01..0x08) ---- */
   {
-    size_t dmem = 0;
-    if(!sceKernelGetDirectMemorySize(&dmem))
-      fprintf(fp, "direct_mem_size: %zu bytes (%zu MB)\n", dmem, dmem/(1024*1024));
+    uint8_t region[9];
+    memset(region, 0, sizeof(region));
+    kernel_copyout(KERNEL_ADDRESS_SECURITY_FLAGS, region, sizeof(region));
+    fprintf(fp, "--- SECURITY_FLAGS extended region (9 bytes) ---\n");
+    fprintf(fp, "  ");
+    for(int i = 0; i < 9; i++)
+      fprintf(fp, "%02x ", region[i]);
+    fprintf(fp, "\n");
+    fprintf(fp, "  [+0x00] security_flags: 0x%02x\n", region[0]);
+    fprintf(fp, "  [+0x01] unknown_01:     0x%02x\n", region[1]);
+    fprintf(fp, "  [+0x02] unknown_02:     0x%02x\n", region[2]);
+    fprintf(fp, "  [+0x03] unknown_03:     0x%02x\n", region[3]);
+    fprintf(fp, "  [+0x04] unknown_04:     0x%02x\n", region[4]);
+    fprintf(fp, "  [+0x05] unknown_05:     0x%02x\n", region[5]);
+    fprintf(fp, "  [+0x06] unknown_06:     0x%02x\n", region[6]);
+    fprintf(fp, "  [+0x07] unknown_07:     0x%02x\n", region[7]);
+    fprintf(fp, "  [+0x08] unknown_08:     0x%02x\n", region[8]);
+    fprintf(fp, "\n");
   }
 
+  /* ---- TARGET ID ---- */
   {
-    char socid[8] = {0};
-    char socid_hex[20];
-    if(!sceKernelGetMainSocId(socid)) {
-      hex_string((uint8_t*)socid, socid_hex, 8);
-      fprintf(fp, "main_soc_id:     %s\n", socid_hex);
-    }
+    uint8_t tid = kernel_getchar(KERNEL_ADDRESS_TARGETID);
+    fprintf(fp, "--- TARGET ID (@ 0x%lx = SECFLAGS+0x09) ---\n",
+            KERNEL_ADDRESS_TARGETID);
+    fprintf(fp, "  value: 0x%02x = %s\n\n", tid, targetid_name(tid));
   }
 
-  if(!sceKernelGetGPI(&val))
-    fprintf(fp, "gpi:             0x%08x\n", val);
-
-  if(!sceKernelGetGPO(&val))
-    fprintf(fp, "gpo:             0x%08x\n", val);
-
-  fclose(fp);
-  printf("wrote %s\n", path);
-}
-
-/* ---- payload args from ELF loader ---- */
-static void
-write_payload_args(void) {
-  FILE* fp;
-  char path[256];
-  payload_args_t* args = payload_get_args();
-
-  if(!args) return;
-
-  snprintf(path, sizeof(path), "%s/payload_args.txt", OUT_DIR);
-  fp = fopen(path, "w");
-  if(!fp) { perror(path); return; }
-
-  fprintf(fp, "# payload_args_t from ELF loader\n\n");
-  fprintf(fp, "kpipe_addr:      0x%lx\n", args->kpipe_addr);
-  fprintf(fp, "kdata_base_addr: 0x%lx\n", args->kdata_base_addr);
-
-  fclose(fp);
-  printf("wrote %s\n", path);
-}
-
-/* ---- system version strings ---- */
-static void
-write_sysinfo(void) {
-  FILE* fp;
-  char path[256];
-  char buf[256];
-  unsigned int ver = 0;
-
-  snprintf(path, sizeof(path), "%s/sysinfo.txt", OUT_DIR);
-  fp = fopen(path, "w");
-  if(!fp) { perror(path); return; }
-
-  fprintf(fp, "# system info\n\n");
-
-  if(!sceKernelGetProsperoSystemSwVersion(&ver))
-    fprintf(fp, "prospero_sw_ver: 0x%08x\n", ver);
-
-  buf[0] = '\0';
-  if(!sceKernelGetSystemSwVersion(buf))
-    fprintf(fp, "system_sw_ver:   %s\n", buf);
-
-  buf[0] = '\0';
-  if(!sceKernelGetUpdVersion(buf))
-    fprintf(fp, "upd_version:     %s\n", buf);
-
+  /* ---- QA FLAGS ---- */
   {
-    char openpsid[16] = {0};
-    char openpsid_hex[40];
-    if(!sceKernelGetOpenPsId(openpsid)) {
-      hex_string((uint8_t*)openpsid, openpsid_hex, 16);
-      fprintf(fp, "open_psid:       %s\n", openpsid_hex);
-    }
+    uint8_t qaflags[16] = {0};
+    kernel_get_qaflags(qaflags);
+    fprintf(fp, "--- QA_FLAGS (@ 0x%lx = SECFLAGS+0x24, 16 bytes) ---\n",
+            KERNEL_ADDRESS_QA_FLAGS);
+    print_named_bits(fp, qaflags, sizeof(qaflags),
+                     qaflags_names,
+                     sizeof(qaflags_names)/sizeof(qaflags_names[0]));
+    fprintf(fp, "\n");
   }
 
+  /* ---- UTOKEN FLAGS ---- */
   {
-    unsigned int subsysid = 0;
-    if(!sceKernelGetSubsysId(&subsysid))
-      fprintf(fp, "subsys_id:       0x%08x\n", subsysid);
+    /* read 4 bytes at utoken flags to get the full field */
+    uint8_t utflags[4] = {0};
+    kernel_copyout(KERNEL_ADDRESS_UTOKEN_FLAGS, utflags, sizeof(utflags));
+    fprintf(fp, "--- UTOKEN_FLAGS (@ 0x%lx = SECFLAGS+0x8C, 4 bytes) ---\n",
+            KERNEL_ADDRESS_UTOKEN_FLAGS);
+    fprintf(fp, "  raw: 0x%02x%02x%02x%02x\n",
+            utflags[0], utflags[1], utflags[2], utflags[3]);
+    print_bits(fp, "utoken", utflags, sizeof(utflags));
+    fprintf(fp, "\n");
   }
 
+  /* ---- Full SECFLAGS region hex dump (0x00..0x9F) ---- */
   {
-    pid_t pid = getpid();
-    buf[0] = '\0';
-    if(!sceKernelGetProcessName(pid, buf))
-      fprintf(fp, "process_name:    %s\n", buf);
-
-    unsigned int ptype = 0;
-    if(!sceKernelGetProcessType(pid, &ptype))
-      fprintf(fp, "process_type:    0x%x\n", ptype);
-  }
-
-  fclose(fp);
-  printf("wrote %s\n", path);
-}
-
-/* ---- process list via sysctl ---- */
-static void
-write_proclist(void) {
-  FILE* fp;
-  char path[256];
-  int mib[4] = {1, 14, 8, 0}; /* CTL_KERN, KERN_PROC, KERN_PROC_ALL */
-  size_t buf_size = 0;
-  uint8_t *buf;
-
-  snprintf(path, sizeof(path), "%s/proclist.txt", OUT_DIR);
-  fp = fopen(path, "w");
-  if(!fp) { perror(path); return; }
-
-  fprintf(fp, "# running processes\n");
-  fprintf(fp, "# pid    name\n\n");
-
-  if(sysctl(mib, 4, 0, &buf_size, 0, 0)) {
-    perror("sysctl size");
-    fclose(fp);
-    return;
-  }
-
-  buf = malloc(buf_size);
-  if(!buf) {
-    fclose(fp);
-    return;
-  }
-
-  if(sysctl(mib, 4, buf, &buf_size, 0, 0)) {
-    perror("sysctl data");
-    free(buf);
-    fclose(fp);
-    return;
-  }
-
-  for(uint8_t *ptr = buf; ptr < (buf + buf_size);) {
-    int ki_structsize = *(int*)ptr;
-    pid_t ki_pid = *(pid_t*)&ptr[72];
-    char *ki_tdname = (char*)&ptr[447];
-
-    if(ki_structsize <= 0) break;
-    fprintf(fp, "%-8d %s\n", ki_pid, ki_tdname);
-    ptr += ki_structsize;
-  }
-
-  free(buf);
-  fclose(fp);
-  printf("wrote %s\n", path);
-}
-
-/* ---- kernel memory region around SECURITY_FLAGS ---- */
-static void
-write_secflags_region(void) {
-  FILE* fp;
-  char path[256];
-  uint8_t region[256];
-
-  if(!KERNEL_ADDRESS_SECURITY_FLAGS) return;
-
-  snprintf(path, sizeof(path), "%s/secflags_region.txt", OUT_DIR);
-  fp = fopen(path, "w");
-  if(!fp) { perror(path); return; }
-
-  fprintf(fp, "# 256 bytes starting at SECURITY_FLAGS (0x%lx)\n",
-          KERNEL_ADDRESS_SECURITY_FLAGS);
-  fprintf(fp, "# contains: security_flags(+0x00), targetid(+0x09),\n");
-  fprintf(fp, "#           qa_flags(+0x24), utoken_flags(+0x8c)\n\n");
-
-  memset(region, 0, sizeof(region));
-  if(!kernel_copyout(KERNEL_ADDRESS_SECURITY_FLAGS, region, sizeof(region))) {
-    for(int i = 0; i < 256; i += 16) {
-      fprintf(fp, "%04x: ", i);
-      for(int j = 0; j < 16; j++)
-        fprintf(fp, "%02x ", region[i+j]);
-      fprintf(fp, " ");
-      for(int j = 0; j < 16; j++) {
-        uint8_t c = region[i+j];
-        fprintf(fp, "%c", (c >= 0x20 && c < 0x7f) ? c : '.');
+    uint8_t region[0xA0];
+    memset(region, 0, sizeof(region));
+    if(!kernel_copyout(KERNEL_ADDRESS_SECURITY_FLAGS, region, sizeof(region))) {
+      fprintf(fp, "--- FULL SECFLAGS REGION (0xA0 bytes) ---\n");
+      fprintf(fp, "  base: 0x%lx\n", KERNEL_ADDRESS_SECURITY_FLAGS);
+      for(int i = 0; i < 0xA0; i += 16) {
+        fprintf(fp, "  +%02x: ", i);
+        for(int j = 0; j < 16 && (i+j) < 0xA0; j++)
+          fprintf(fp, "%02x ", region[i+j]);
+        fprintf(fp, " ");
+        for(int j = 0; j < 16 && (i+j) < 0xA0; j++) {
+          uint8_t c = region[i+j];
+          fprintf(fp, "%c", (c >= 0x20 && c < 0x7f) ? c : '.');
+        }
+        fprintf(fp, "\n");
       }
       fprintf(fp, "\n");
     }
   }
 
-  fclose(fp);
-  printf("wrote %s\n", path);
-}
+  /* ---- SCE UCRED: authid, caps, attrs for our process ---- */
+  {
+    uint8_t caps[16] = {0};
+    uint8_t attrs[32] = {0};
+    uint64_t authid = kernel_get_ucred_authid(pid);
 
-/* ---- dynlib info for our process ---- */
-static void
-write_dynlib_info(void) {
-  FILE* fp;
-  char path[256];
-  pid_t pid = getpid();
-  /* try a few well-known library names */
-  static const char *libs[] = {
-    "libkernel.sprx",
-    "libkernel_sys.sprx",
-    "libSceLibcInternal.sprx",
-    "libSceSysmodule.sprx",
-    "libSceSystemService.sprx",
-    "libSceNet.sprx",
-    "libSceNetCtl.sprx",
-    "libScePad.sprx",
-    "libSceVideoOut.sprx",
-    "libSceAudioOut.sprx",
-    "libSceGnmDriver.sprx",
-    "libSceUserService.sprx",
-    NULL
-  };
+    fprintf(fp, "--- SCE AUTHID (pid %d) ---\n", pid);
+    fprintf(fp, "  value: 0x%016lx\n", authid);
+    /* decode authid fields */
+    fprintf(fp, "  program_type:  0x%02lx\n", (authid >> 56) & 0xff);
+    fprintf(fp, "  program_attr:  0x%04lx\n", (authid >> 40) & 0xffff);
+    fprintf(fp, "  program_id:    0x%010lx\n", authid & 0xffffffffffUL);
+    fprintf(fp, "\n");
 
-  snprintf(path, sizeof(path), "%s/dynlib.txt", OUT_DIR);
-  fp = fopen(path, "w");
-  if(!fp) { perror(path); return; }
+    fprintf(fp, "--- SCE CAPS (pid %d, 16 bytes) ---\n", pid);
+    kernel_get_ucred_caps(pid, caps);
+    print_named_bits(fp, caps, sizeof(caps),
+                     scecaps_names,
+                     sizeof(scecaps_names)/sizeof(scecaps_names[0]));
+    fprintf(fp, "\n");
 
-  fprintf(fp, "# loaded library base addresses (pid %d)\n\n", pid);
+    fprintf(fp, "--- SCE ATTRS (pid %d, 32 bytes) ---\n", pid);
+    kernel_get_ucred_attrs(pid, attrs);
+    print_named_bits(fp, attrs, sizeof(attrs),
+                     sceattrs_names,
+                     sizeof(sceattrs_names)/sizeof(sceattrs_names[0]));
+    fprintf(fp, "\n");
+  }
 
-  for(int i = 0; libs[i]; i++) {
-    uint32_t handle = 0;
-    if(!kernel_dynlib_handle(pid, libs[i], &handle)) {
-      intptr_t base = kernel_dynlib_mapbase_addr(pid, handle);
-      intptr_t entry = kernel_dynlib_entry_addr(pid, handle);
-      intptr_t init  = kernel_dynlib_init_addr(pid, handle);
-      intptr_t fini  = kernel_dynlib_fini_addr(pid, handle);
-      fprintf(fp, "%s\n", libs[i]);
-      fprintf(fp, "  handle:  0x%x\n", handle);
-      fprintf(fp, "  mapbase: 0x%lx\n", base);
-      fprintf(fp, "  entry:   0x%lx\n", entry);
-      fprintf(fp, "  init:    0x%lx\n", init);
-      fprintf(fp, "  fini:    0x%lx\n", fini);
+  /* ---- UCRED privilege flags ---- */
+  {
+    fprintf(fp, "--- UCRED IDS (pid %d) ---\n", pid);
+    fprintf(fp, "  uid:     %d\n", kernel_get_ucred_uid(pid));
+    fprintf(fp, "  ruid:    %d\n", kernel_get_ucred_ruid(pid));
+    fprintf(fp, "  svuid:   %d\n", kernel_get_ucred_svuid(pid));
+    fprintf(fp, "  rgid:    %d\n", kernel_get_ucred_rgid(pid));
+    fprintf(fp, "  svgid:   %d\n", kernel_get_ucred_svgid(pid));
+    fprintf(fp, "  prison:  0x%lx (0 = unjailed)\n", kernel_get_ucred_prison(pid));
+    fprintf(fp, "\n");
+  }
+
+  /* ---- APP INFO flags ---- */
+  {
+    app_info_t app = {0};
+    if(!sceKernelGetAppInfo(pid, &app)) {
+      fprintf(fp, "--- APP INFO (pid %d) ---\n", pid);
+      fprintf(fp, "  app_id:    %u\n", app.app_id);
+      fprintf(fp, "  title_id:  %s\n", app.title_id);
+      fprintf(fp, "\n");
+    }
+  }
+
+  /* ---- MISC FLAGS ---- */
+  {
+    unsigned int val = 0;
+    fprintf(fp, "--- MISC FLAGS ---\n");
+
+    if(!sceKernelGetSafemode(&val))
+      fprintf(fp, "  safemode:     %u (%s)\n", val, val ? "ON" : "OFF");
+
+    if(!sceKernelGetAslrStatus(&val))
+      fprintf(fp, "  aslr:         %u (%s)\n", val, val ? "ENABLED" : "DISABLED");
+
+    if(!sceKernelGetGPI(&val))
+      fprintf(fp, "  GPI:          0x%08x\n", val);
+
+    if(!sceKernelGetGPO(&val))
+      fprintf(fp, "  GPO:          0x%08x\n", val);
+
+    fprintf(fp, "\n");
+  }
+
+  /* ---- Also dump flags for pid 0 (kernel) and pid 1 (init) ---- */
+  {
+    static const pid_t pids[] = {0, 1};
+    static const char* pnames[] = {"kernel (pid 0)", "init (pid 1)"};
+    for(int p = 0; p < 2; p++) {
+      pid_t tpid = pids[p];
+      uint8_t caps[16] = {0};
+      uint8_t attrs[32] = {0};
+
+      intptr_t proc = kernel_get_proc(tpid);
+      if(!proc) continue;
+
+      fprintf(fp, "--- %s ---\n", pnames[p]);
+      fprintf(fp, "  authid: 0x%016lx\n", kernel_get_ucred_authid(tpid));
+
+      kernel_get_ucred_caps(tpid, caps);
+      fprintf(fp, "  caps:   0x");
+      for(int i = 0; i < 16; i++) fprintf(fp, "%02x", caps[i]);
+      fprintf(fp, "\n");
+
+      kernel_get_ucred_attrs(tpid, attrs);
+      fprintf(fp, "  attrs:  0x");
+      for(int i = 0; i < 32; i++) fprintf(fp, "%02x", attrs[i]);
+      fprintf(fp, "\n");
+
+      fprintf(fp, "  uid:    %d\n", kernel_get_ucred_uid(tpid));
+      fprintf(fp, "  prison: 0x%lx\n", kernel_get_ucred_prison(tpid));
       fprintf(fp, "\n");
     }
   }
 
   fclose(fp);
-  printf("wrote %s\n", path);
-}
 
-int
-main(void) {
-  mkdir(OUT_DIR, 0777);
+  /* also print to stdout so it comes back over nc */
+  {
+    FILE* rd = fopen(OUT_FILE, "r");
+    if(rd) {
+      char line[512];
+      while(fgets(line, sizeof(line), rd))
+        printf("%s", line);
+      fclose(rd);
+    }
+  }
 
-  write_offsets();
-  write_runtime();
-  write_hwinfo();
-  write_payload_args();
-  write_sysinfo();
-  write_proclist();
-  write_secflags_region();
-  write_dynlib_info();
-
-  printf("done — all files in " OUT_DIR "\n");
-  notify("testpayload: wrote all data to " OUT_DIR);
-
+  notify("testpayload: flags dumped to " OUT_FILE);
   return 0;
 }

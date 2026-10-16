@@ -949,54 +949,19 @@ enable_testkit(void) {
 
   fprintf(fp, "=== ENABLE DEVKIT/TESTKIT FLAGS ===\n\n");
 
-  /* TARGETID, SECURITY_FLAGS, UTOKEN_FLAGS are HW-protected by the hypervisor.
-     Writing them requires bypervisor to be run first to lower HV protections.
-     We attempt writes in a forked child — if it panics/dies, the parent survives. */
-
-  /* 0. Try to set SECURITY_FLAGS + TARGETID in a fork (safe if it fails) */
+  /* TARGETID, SECURITY_FLAGS, UTOKEN_FLAGS are HV-protected.
+     kernel_setchar() on them causes a kernel panic even in a fork.
+     We only READ them here. To write them, bypervisor must be run first
+     and a separate HV-aware payload is needed. */
   {
-    uint8_t sf_before = kernel_getchar(KERNEL_ADDRESS_SECURITY_FLAGS);
-    uint8_t ut_before = kernel_getchar(KERNEL_ADDRESS_UTOKEN_FLAGS);
-    uint8_t tid_before = kernel_getchar(KERNEL_ADDRESS_TARGETID);
-
-    fprintf(fp, "SECURITY_FLAGS before: 0x%02x\n", sf_before);
-    fprintf(fp, "UTOKEN_FLAGS before:   0x%02x\n", ut_before);
-    fprintf(fp, "TARGETID before:       0x%02x = %s\n\n", tid_before, targetid_name(tid_before));
-
-    pid_t child = fork();
-    if(child == 0) {
-      /* child: attempt the writes — if HV blocks, child dies, parent continues */
-      uint8_t sf_new = sf_before | (1<<0)|(1<<2)|(1<<3)|(1<<5)|(1<<6)|(1<<7);
-      kernel_setchar(KERNEL_ADDRESS_SECURITY_FLAGS, sf_new);
-      kernel_setchar(KERNEL_ADDRESS_UTOKEN_FLAGS, 0xff);
-      kernel_setchar(KERNEL_ADDRESS_TARGETID, 0x02);
-      _exit(0);
-    } else if(child > 0) {
-      int status = 0;
-      waitpid(child, &status, 0);
-      if(WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-        uint8_t sf_after = kernel_getchar(KERNEL_ADDRESS_SECURITY_FLAGS);
-        uint8_t ut_after = kernel_getchar(KERNEL_ADDRESS_UTOKEN_FLAGS);
-        uint8_t tid_after = kernel_getchar(KERNEL_ADDRESS_TARGETID);
-
-        fprintf(fp, "SECURITY_FLAGS after:  0x%02x %s\n", sf_after,
-                sf_after != sf_before ? "(CHANGED)" : "(unchanged — HV still protecting)");
-        fprintf(fp, "UTOKEN_FLAGS after:    0x%02x %s\n", ut_after,
-                ut_after != ut_before ? "(CHANGED)" : "(unchanged — HV still protecting)");
-        fprintf(fp, "TARGETID after:        0x%02x %s\n", tid_after,
-                tid_after != tid_before ? "(CHANGED)" : "(unchanged — HV still protecting)");
-        printf("enable_testkit: secflags write attempted (child exited OK)\n");
-
-        if(sf_after == sf_before && ut_after == ut_before)
-          fprintf(fp, "  -> run bypervisor first to lower HV protections\n");
-      } else {
-        fprintf(fp, "  child died (signal %d) — HV blocked the write\n",
-                WIFSIGNALED(status) ? WTERMSIG(status) : -1);
-        fprintf(fp, "  -> run bypervisor first, then re-run this payload\n");
-        printf("enable_testkit: secflags write failed (child killed) — need bypervisor\n");
-      }
-    }
-    fprintf(fp, "\n");
+    uint8_t sf = kernel_getchar(KERNEL_ADDRESS_SECURITY_FLAGS);
+    uint8_t ut = kernel_getchar(KERNEL_ADDRESS_UTOKEN_FLAGS);
+    uint8_t tid = kernel_getchar(KERNEL_ADDRESS_TARGETID);
+    fprintf(fp, "SECURITY_FLAGS: 0x%02x (HV-protected, read-only)\n", sf);
+    fprintf(fp, "UTOKEN_FLAGS:   0x%02x (HV-protected, read-only)\n", ut);
+    fprintf(fp, "TARGETID:       0x%02x = %s (HV-protected, read-only)\n", tid, targetid_name(tid));
+    fprintf(fp, "  -> to enable devkit panel: run bypervisor first,\n");
+    fprintf(fp, "     then use an HV-level payload to write these flags\n\n");
   }
 
   /* 1. QA FLAGS — enable testkit-relevant bits (safe via SDK function) */

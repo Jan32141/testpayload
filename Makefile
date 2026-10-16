@@ -11,8 +11,9 @@ KILLSHELL := killshell.elf
 REGDUMP := regdump.elf
 SYSREGDUMP := sysregdump.elf
 KEYSCAN := keyscan.elf
+SHELLSCAN := shellscan.elf
 
-all: $(ELF) $(KILLSHELL) $(REGDUMP) $(SYSREGDUMP) $(KEYSCAN)
+all: $(ELF) $(KILLSHELL) $(REGDUMP) $(SYSREGDUMP) $(KEYSCAN) $(SHELLSCAN)
 
 $(ELF): main.c
 	$(CC) $(CFLAGS) $^ -o $@
@@ -29,8 +30,11 @@ $(SYSREGDUMP): sysregdump.c
 $(KEYSCAN): keyscan.c
 	$(CC) -Wall -lkernel_sys -lSceRegMgr $^ -o $@
 
+$(SHELLSCAN): shellscan.c
+	$(CC) -Wall -lkernel_sys $^ -o $@
+
 clean:
-	rm -f $(ELF) $(KILLSHELL) $(REGDUMP) $(SYSREGDUMP) $(KEYSCAN)
+	rm -f $(ELF) $(KILLSHELL) $(REGDUMP) $(SYSREGDUMP) $(KEYSCAN) $(SHELLSCAN)
 
 test: $(ELF)
 	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $^

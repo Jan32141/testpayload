@@ -19,6 +19,9 @@
 #include <ps5/kernel.h>
 #include <ps5/iommu.h>
 
+extern const intptr_t KERNEL_ADDRESS_DMAP_BASE;
+extern const intptr_t KERNEL_ADDRESS_IOMMU_SOFTC;
+
 #define OUT_DIR "/data/testpayload"
 
 int sceKernelGetProcessName(pid_t, char *);
@@ -623,45 +626,236 @@ restore_handler:
   kernel_copyin(&orig_kind, struct_base + 0x1c, 4);
 
 try_code_patch:;
-  /* Strategy 3: IOMMU DMA write to patch handler TEXT.
+  /* Strategy 3: Write to kernel TEXT via DMAP (Direct Map).
    * The real handler at +0x55 has: 74 07 (jz +7) which skips val=1.
-   * NOP it out (90 90) so val=1 is always set. */
-  printf("devkitact: phase 3e - IOMMU text patch\n");
-  fprintf(fp, "\n  === STRATEGY 3: IOMMU text patch (jz -> NOP NOP) ===\n");
+   * NOP it out (90 90) so val=1 is always set.
+   *
+   * kernel_copyin to TEXT panics (page is mapped read-only in kernel VA).
+   * But the DMAP region maps ALL physical memory as RW.
+   * Steps: walk x86 page tables to find physical address, then write
+   * via DMAP_BASE + paddr using kernel_copyin. */
+  printf("devkitact: phase 3e - DMAP text patch\n");
+  fprintf(fp, "\n  === STRATEGY 3: DMAP text patch (jz -> NOP NOP) ===\n");
 
   intptr_t patch_addr = real_handler + 0x55;
   unsigned char patch_bytes[2];
   kernel_copyout(patch_addr, patch_bytes, 2);
   fprintf(fp, "  real_handler+0x55: %02x %02x\n", patch_bytes[0], patch_bytes[1]);
 
-  if(patch_bytes[0] == 0x74 && patch_bytes[1] == 0x07) {
-    fprintf(fp, "  Confirmed jz +7 at patch target\n");
-    int r1 = kernel_iommu_setchar(patch_addr, (char)0x90);
-    int r2 = kernel_iommu_setchar(patch_addr + 1, (char)0x90);
-    fprintf(fp, "  IOMMU write 0x90 @ +0x55: ret=%d\n", r1);
-    fprintf(fp, "  IOMMU write 0x90 @ +0x56: ret=%d\n", r2);
+  if(patch_bytes[0] != 0x74 || patch_bytes[1] != 0x07) {
+    fprintf(fp, "  Unexpected bytes (expected 74 07), skipping\n");
+    goto strategy3_done;
+  }
+  fprintf(fp, "  Confirmed jz +7 at patch target\n");
 
-    kernel_copyout(patch_addr, patch_bytes, 2);
-    fprintf(fp, "  Verify: real_handler+0x55: %02x %02x\n",
-            patch_bytes[0], patch_bytes[1]);
+  intptr_t dmap_base = KERNEL_ADDRESS_DMAP_BASE;
+  fprintf(fp, "  DMAP_BASE = 0x%lx\n", (unsigned long)dmap_base);
+  fprintf(fp, "  IOMMU_SOFTC = 0x%lx\n", (unsigned long)KERNEL_ADDRESS_IOMMU_SOFTC);
 
-    if(patch_bytes[0] == 0x90 && patch_bytes[1] == 0x90) {
-      fprintf(fp, "  Text patch applied!\n");
-      check = -1; clen = sizeof(check);
-      sysctlbyname("machdep.check_genuine_devkit_for_psm", &check, &clen, NULL, 0);
-      fprintf(fp, "  machdep.check_genuine_devkit_for_psm = %d\n", check);
-      if(check == 1) {
-        fprintf(fp, "  *** SUCCESS via IOMMU text patch! ***\n");
-        goto patched;
-      }
-    } else {
-      fprintf(fp, "  IOMMU write did not stick\n");
-    }
-  } else {
-    fprintf(fp, "  Unexpected bytes (expected 74 07), skipping patch\n");
+  if(!dmap_base) {
+    fprintf(fp, "  DMAP_BASE is 0, cannot use DMAP method\n");
+    goto try_iommu;
   }
 
+  /* Walk x86-64 page tables to translate kernel VA -> PA.
+   * Read CR3 from the kernel's PCPU or via a known location. On FreeBSD,
+   * kernel CR3 is at proc0's pmap. But we can also use the recursive
+   * page table mapping or just scan for the PML4 entry.
+   *
+   * On FreeBSD/PS5, the kernel page tables are in the DMAP region.
+   * The kernel's PML4 physical base can be found from a known kernel
+   * global (IdlePML4 or KPML4phys). We'll scan for it. */
+
+  /* Strategy 3a: Try IOMMU first (uses DMAP + hardware IOMMU) */
+try_iommu:;
+  fprintf(fp, "\n  Trying IOMMU write...\n");
+  int r1 = kernel_iommu_setchar(patch_addr, (char)0x90);
+  int r2 = kernel_iommu_setchar(patch_addr + 1, (char)0x90);
+  fprintf(fp, "  IOMMU write 0x90 @ +0x55: ret=%d (errno=%d)\n", r1, errno);
+  fprintf(fp, "  IOMMU write 0x90 @ +0x56: ret=%d (errno=%d)\n", r2, errno);
+
+  kernel_copyout(patch_addr, patch_bytes, 2);
+  fprintf(fp, "  Verify: real_handler+0x55: %02x %02x\n",
+          patch_bytes[0], patch_bytes[1]);
+
+  if(patch_bytes[0] == 0x90 && patch_bytes[1] == 0x90)
+    goto text_patch_ok;
+
+  /* Strategy 3b: Direct DMAP write via page table walk.
+   * On x86-64, virtual address bits: [47:39]=PML4, [38:30]=PDPT,
+   * [29:21]=PD, [20:12]=PT, [11:0]=offset.
+   * We need CR3 (PML4 physical base). On FreeBSD, KPML4phys is a
+   * global variable. We can also find it via the kernel proc's pmap. */
+  fprintf(fp, "\n  Trying DMAP page-table walk...\n");
+
+  /* Find KPML4phys: it's the physical address of the kernel PML4.
+   * On FreeBSD, allproc -> proc0 -> p_vmspace -> vm_pmap -> pm_cr3.
+   * proc0 is the first entry in allproc. */
+  intptr_t allproc = KERNEL_ADDRESS_ALLPROC;
+  if(!allproc) {
+    fprintf(fp, "  ALLPROC is 0, cannot walk page tables\n");
+    goto strategy3_done;
+  }
+
+  /* proc0 is the first proc. Read its p_vmspace. */
+  intptr_t proc0 = 0;
+  kernel_copyout(allproc, &proc0, 8);
+  fprintf(fp, "  proc0 = 0x%lx\n", (unsigned long)proc0);
+  if(!proc0) {
+    fprintf(fp, "  proc0 is null\n");
+    goto strategy3_done;
+  }
+
+  intptr_t vmspace = 0;
+  off_t p_vmspace_off = KERNEL_OFFSET_PROC_P_VMSPACE;
+  fprintf(fp, "  KERNEL_OFFSET_PROC_P_VMSPACE = 0x%lx\n", (unsigned long)p_vmspace_off);
+  kernel_copyout(proc0 + p_vmspace_off, &vmspace, 8);
+  fprintf(fp, "  proc0->p_vmspace = 0x%lx\n", (unsigned long)vmspace);
+  if(!vmspace) {
+    fprintf(fp, "  vmspace is null\n");
+    goto strategy3_done;
+  }
+
+  /* vm_pmap is at the start of vmspace after the vm_map struct.
+   * On FreeBSD, pmap's pm_cr3 is at a small offset.
+   * vm_map is typically 0x100-0x180 bytes.
+   * The SDK has KERNEL_OFFSET_VMSPACE_VM_PMAP. */
+  off_t pmap_off = KERNEL_OFFSET_VMSPACE_VM_PMAP;
+  fprintf(fp, "  KERNEL_OFFSET_VMSPACE_VM_PMAP = 0x%lx\n", (unsigned long)pmap_off);
+
+  /* pm_cr3 is the first uint64_t in the pmap struct on FreeBSD */
+  uint64_t cr3 = 0;
+  intptr_t pmap_addr = vmspace + pmap_off;
+  kernel_copyout(pmap_addr, &cr3, 8);
+  fprintf(fp, "  pmap->pm_cr3 = 0x%lx\n", (unsigned long)cr3);
+
+  /* Validate: CR3 should be a reasonable physical address (< 4GB typically) */
+  if(cr3 == 0 || cr3 > 0x200000000ULL) {
+    fprintf(fp, "  CR3 looks invalid, scanning pmap struct...\n");
+    uint64_t pmap_data[32];
+    kernel_copyout(pmap_addr, pmap_data, sizeof(pmap_data));
+    for(int i = 0; i < 32; i++) {
+      if(pmap_data[i] > 0x100000 && pmap_data[i] < 0x200000000ULL &&
+         (pmap_data[i] & 0xFFF) == 0) {
+        fprintf(fp, "  Candidate CR3 at pmap+0x%x = 0x%lx\n",
+                i*8, (unsigned long)pmap_data[i]);
+        cr3 = pmap_data[i];
+        break;
+      }
+    }
+    if(cr3 == 0 || cr3 > 0x200000000ULL) {
+      fprintf(fp, "  Could not find valid CR3\n");
+      goto strategy3_done;
+    }
+  }
+
+  /* Now walk the 4-level page table for our target VA */
+  {
+    uint64_t va = (uint64_t)patch_addr;
+    int pml4_idx = (va >> 39) & 0x1FF;
+    int pdpt_idx = (va >> 30) & 0x1FF;
+    int pd_idx   = (va >> 21) & 0x1FF;
+    int pt_idx   = (va >> 12) & 0x1FF;
+    int pg_off   = va & 0xFFF;
+    fprintf(fp, "  VA 0x%lx -> PML4[%d] PDPT[%d] PD[%d] PT[%d] off=0x%x\n",
+            (unsigned long)va, pml4_idx, pdpt_idx, pd_idx, pt_idx, pg_off);
+
+    /* Read PML4 entry */
+    uint64_t pml4e = 0;
+    kernel_copyout(dmap_base + cr3 + pml4_idx * 8, &pml4e, 8);
+    fprintf(fp, "  PML4E = 0x%lx\n", (unsigned long)pml4e);
+    if(!(pml4e & 1)) { fprintf(fp, "  PML4E not present\n"); goto strategy3_done; }
+
+    /* Read PDPT entry */
+    uint64_t pdpte = 0;
+    kernel_copyout(dmap_base + (pml4e & 0x000FFFFFFFFFF000ULL) + pdpt_idx * 8, &pdpte, 8);
+    fprintf(fp, "  PDPTE = 0x%lx\n", (unsigned long)pdpte);
+    if(!(pdpte & 1)) { fprintf(fp, "  PDPTE not present\n"); goto strategy3_done; }
+    if(pdpte & 0x80) {
+      /* 1GB page */
+      uint64_t paddr = (pdpte & 0x000FFFFFC0000000ULL) | (va & 0x3FFFFFFF);
+      fprintf(fp, "  1GB page, PA = 0x%lx\n", (unsigned long)paddr);
+      intptr_t dmap_target = dmap_base + paddr;
+      fprintf(fp, "  DMAP target = 0x%lx\n", (unsigned long)dmap_target);
+      unsigned char nops[2] = {0x90, 0x90};
+      kernel_copyin(nops, dmap_target, 2);
+      kernel_copyout(patch_addr, patch_bytes, 2);
+      fprintf(fp, "  After DMAP write: %02x %02x\n", patch_bytes[0], patch_bytes[1]);
+      if(patch_bytes[0] == 0x90 && patch_bytes[1] == 0x90)
+        goto text_patch_ok;
+      fprintf(fp, "  DMAP 1GB write failed\n");
+      goto strategy3_done;
+    }
+
+    /* Read PD entry */
+    uint64_t pde = 0;
+    kernel_copyout(dmap_base + (pdpte & 0x000FFFFFFFFFF000ULL) + pd_idx * 8, &pde, 8);
+    fprintf(fp, "  PDE = 0x%lx\n", (unsigned long)pde);
+    if(!(pde & 1)) { fprintf(fp, "  PDE not present\n"); goto strategy3_done; }
+    if(pde & 0x80) {
+      /* 2MB page */
+      uint64_t paddr = (pde & 0x000FFFFFFFE00000ULL) | (va & 0x1FFFFF);
+      fprintf(fp, "  2MB page, PA = 0x%lx\n", (unsigned long)paddr);
+      intptr_t dmap_target = dmap_base + paddr;
+      fprintf(fp, "  DMAP target = 0x%lx\n", (unsigned long)dmap_target);
+      unsigned char nops[2] = {0x90, 0x90};
+      kernel_copyin(nops, dmap_target, 2);
+      kernel_copyout(patch_addr, patch_bytes, 2);
+      fprintf(fp, "  After DMAP write: %02x %02x\n", patch_bytes[0], patch_bytes[1]);
+      if(patch_bytes[0] == 0x90 && patch_bytes[1] == 0x90)
+        goto text_patch_ok;
+      fprintf(fp, "  DMAP 2MB write failed\n");
+      goto strategy3_done;
+    }
+
+    /* Read PT entry (4KB page) */
+    uint64_t pte = 0;
+    kernel_copyout(dmap_base + (pde & 0x000FFFFFFFFFF000ULL) + pt_idx * 8, &pte, 8);
+    fprintf(fp, "  PTE = 0x%lx\n", (unsigned long)pte);
+    if(!(pte & 1)) { fprintf(fp, "  PTE not present\n"); goto strategy3_done; }
+
+    uint64_t paddr = (pte & 0x000FFFFFFFFFF000ULL) | pg_off;
+    fprintf(fp, "  4KB page, PA = 0x%lx\n", (unsigned long)paddr);
+    intptr_t dmap_target = dmap_base + paddr;
+    fprintf(fp, "  DMAP target = 0x%lx\n", (unsigned long)dmap_target);
+
+    /* Verify by reading through DMAP — should match what we read via kernel VA */
+    unsigned char dmap_verify[2];
+    kernel_copyout(dmap_target, dmap_verify, 2);
+    fprintf(fp, "  DMAP read verify: %02x %02x (expect 74 07)\n",
+            dmap_verify[0], dmap_verify[1]);
+    if(dmap_verify[0] != 0x74 || dmap_verify[1] != 0x07) {
+      fprintf(fp, "  DMAP read mismatch — wrong physical address?\n");
+      goto strategy3_done;
+    }
+
+    /* Write NOPs through DMAP */
+    unsigned char nops[2] = {0x90, 0x90};
+    kernel_copyin(nops, dmap_target, 2);
+
+    /* Verify through original kernel VA */
+    kernel_copyout(patch_addr, patch_bytes, 2);
+    fprintf(fp, "  After DMAP write: %02x %02x\n", patch_bytes[0], patch_bytes[1]);
+    if(patch_bytes[0] == 0x90 && patch_bytes[1] == 0x90)
+      goto text_patch_ok;
+    fprintf(fp, "  DMAP 4KB write failed\n");
+  }
+
+strategy3_done:
   fprintf(fp, "\n  === ALL STRATEGIES EXHAUSTED ===\n");
+  free(buf);
+  return;
+
+text_patch_ok:
+  fprintf(fp, "  Text patch applied!\n");
+  check = -1; clen = sizeof(check);
+  sysctlbyname("machdep.check_genuine_devkit_for_psm", &check, &clen, NULL, 0);
+  fprintf(fp, "  machdep.check_genuine_devkit_for_psm = %d\n", check);
+  if(check == 1) {
+    fprintf(fp, "  *** SUCCESS via text patch! ***\n");
+    goto patched;
+  }
+  fprintf(fp, "  Text patch applied but sysctl still returns %d\n", check);
   free(buf);
   return;
 

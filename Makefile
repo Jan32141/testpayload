@@ -15,8 +15,9 @@ SHELLSCAN := shellscan.elf
 DEEPSCAN := deepscan.elf
 DIPSWPATCH := dipswpatch.elf
 PANELSCAN := panelscan.elf
+DEVKITACT := devkitact.elf
 
-all: $(ELF) $(KILLSHELL) $(REGDUMP) $(SYSREGDUMP) $(KEYSCAN) $(SHELLSCAN) $(DEEPSCAN) $(DIPSWPATCH) $(PANELSCAN)
+all: $(ELF) $(KILLSHELL) $(REGDUMP) $(SYSREGDUMP) $(KEYSCAN) $(SHELLSCAN) $(DEEPSCAN) $(DIPSWPATCH) $(PANELSCAN) $(DEVKITACT)
 
 $(ELF): main.c
 	$(CC) $(CFLAGS) $^ -o $@
@@ -45,8 +46,11 @@ $(DIPSWPATCH): dipswpatch.c
 $(PANELSCAN): panelscan.c
 	$(CC) -Wall -lkernel_sys $^ -o $@
 
+$(DEVKITACT): devkitact.c
+	$(CC) -Wall -lkernel_sys -lSceRegMgr $^ -o $@
+
 clean:
-	rm -f $(ELF) $(KILLSHELL) $(REGDUMP) $(SYSREGDUMP) $(KEYSCAN) $(SHELLSCAN) $(DEEPSCAN) $(DIPSWPATCH) $(PANELSCAN)
+	rm -f $(ELF) $(KILLSHELL) $(REGDUMP) $(SYSREGDUMP) $(KEYSCAN) $(SHELLSCAN) $(DEEPSCAN) $(DIPSWPATCH) $(PANELSCAN) $(DEVKITACT)
 
 test: $(ELF)
 	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $^

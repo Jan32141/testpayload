@@ -626,39 +626,71 @@ restore_handler:
   kernel_copyin(&orig_kind, struct_base + 0x1c, 4);
 
 try_code_patch:;
-  /* Strategy 3: Write to kernel TEXT via DMAP (Direct Map).
-   * The real handler at +0x55 has: 74 07 (jz +7) which skips val=1.
-   * NOP it out (90 90) so val=1 is always set.
-   *
-   * kernel_copyin to TEXT panics (page is mapped read-only in kernel VA).
-   * The DMAP region maps ALL physical memory as RW. We find the physical
-   * address by scanning DMAP for the handler's unique code signature. */
-  printf("devkitact: phase 3e - DMAP text patch\n");
-  fprintf(fp, "\n  === STRATEGY 3: DMAP text patch (jz -> NOP NOP) ===\n");
-
+  /* Common setup for text patching strategies */
   intptr_t patch_addr = real_handler + 0x55;
   unsigned char patch_bytes[2];
   kernel_copyout(patch_addr, patch_bytes, 2);
-  fprintf(fp, "  real_handler+0x55: %02x %02x\n", patch_bytes[0], patch_bytes[1]);
 
   if(patch_bytes[0] != 0x74 || patch_bytes[1] != 0x07) {
-    fprintf(fp, "  Unexpected bytes (expected 74 07), skipping\n");
-    goto strategy3_done;
+    fprintf(fp, "\n  real_handler+0x55: %02x %02x (expected 74 07), skipping\n",
+            patch_bytes[0], patch_bytes[1]);
+    fprintf(fp, "\n  === ALL STRATEGIES EXHAUSTED ===\n");
+    free(buf); return;
   }
+
+  /* Strategy 3: Make TEXT page writable via kernel_mprotect, then kernel_copyin.
+   * kernel_mprotect(pid=0, ...) operates on kernel address space.
+   * Once the page has write permission, kernel_copyin can write directly. */
+  printf("devkitact: phase 3e - mprotect text patch\n");
+  fprintf(fp, "\n  === STRATEGY 3: mprotect + kernel_copyin (jz -> NOP NOP) ===\n");
+  fprintf(fp, "  real_handler+0x55: %02x %02x\n", patch_bytes[0], patch_bytes[1]);
   fprintf(fp, "  Confirmed jz +7 at patch target\n");
+
+  {
+    intptr_t page_addr = patch_addr & ~0xFFFLL;
+    fprintf(fp, "  Page-aligned addr: 0x%lx\n", (unsigned long)page_addr);
+
+    int mp_ret = kernel_mprotect(0, page_addr, 0x1000, 7);
+    fprintf(fp, "  kernel_mprotect(0, 0x%lx, 0x1000, RWX=7) = %d (errno=%d)\n",
+            (unsigned long)page_addr, mp_ret, errno);
+
+    if(mp_ret != 0) {
+      int svp_ret = kernel_set_vmem_protection(0, page_addr, 0x1000, 7);
+      fprintf(fp, "  kernel_set_vmem_protection(0, 0x%lx, 0x1000, 7) = %d (errno=%d)\n",
+              (unsigned long)page_addr, svp_ret, errno);
+      if(svp_ret != 0) {
+        fprintf(fp, "  Both mprotect calls failed, trying next strategy\n");
+        goto strategy4;
+      }
+    }
+
+    unsigned char nops[2] = {0x90, 0x90};
+    int ci_ret = kernel_copyin(nops, patch_addr, 2);
+    fprintf(fp, "  kernel_copyin(NOP NOP, 0x%lx, 2) = %d (errno=%d)\n",
+            (unsigned long)patch_addr, ci_ret, errno);
+
+    kernel_copyout(patch_addr, patch_bytes, 2);
+    fprintf(fp, "  Verify: real_handler+0x55: %02x %02x\n",
+            patch_bytes[0], patch_bytes[1]);
+    if(patch_bytes[0] == 0x90 && patch_bytes[1] == 0x90)
+      goto text_patch_ok;
+    fprintf(fp, "  Write did not take effect\n");
+  }
+
+strategy4:;
+  /* Strategy 4: DMAP physical memory scan + write through direct map.
+   * Scan up to 16GB (PS5 has 16GB RAM). Use 2MB chunks. */
+  printf("devkitact: phase 3f - DMAP text patch\n");
+  fprintf(fp, "\n  === STRATEGY 4: DMAP text patch (jz -> NOP NOP) ===\n");
 
   intptr_t dmap_base = KERNEL_ADDRESS_DMAP_BASE;
   fprintf(fp, "  DMAP_BASE = 0x%lx\n", (unsigned long)dmap_base);
 
   if(!dmap_base) {
     fprintf(fp, "  DMAP_BASE is 0, cannot proceed\n");
-    goto strategy3_done;
+    goto all_done;
   }
 
-  /* Find the physical address by scanning DMAP for the handler signature.
-   * The handler starts at page offset (real_handler & 0xFFF) = 0x050.
-   * We search for the first 16 bytes of the handler at that offset
-   * within each physical page, scanning through the DMAP. */
   {
     unsigned char sig[16];
     kernel_copyout(real_handler, sig, 16);
@@ -669,32 +701,35 @@ try_code_patch:;
     fprintf(fp, "\n  Page offset of handler: 0x%x\n", page_off);
     fprintf(fp, "  Page offset of patch target: 0x%x\n", target_off);
 
-    /* Scan physical memory in 2MB chunks through DMAP.
-     * Kernel text is typically in the first 2GB of physical memory. */
     uint64_t found_paddr = 0;
     unsigned char *scan_buf = malloc(0x200000);
     if(!scan_buf) {
       fprintf(fp, "  malloc failed for scan buffer\n");
-      goto strategy3_done;
+      goto all_done;
     }
 
-    fprintf(fp, "  Scanning physical memory for handler signature...\n");
-    for(uint64_t phys = 0; phys < 0x80000000ULL; phys += 0x200000) {
-      if(kernel_copyout(dmap_base + phys, scan_buf, 0x200000)) continue;
+    int read_ok = 0, read_fail = 0;
+    fprintf(fp, "  Scanning physical memory (up to 16GB)...\n");
+    for(uint64_t phys = 0; phys < 0x400000000ULL; phys += 0x200000) {
+      int ret = kernel_copyout(dmap_base + phys, scan_buf, 0x200000);
+      if(ret) { read_fail++; continue; }
+      read_ok++;
       for(int pg = 0; pg < 0x200000; pg += 0x1000) {
         if(pg + page_off + 16 > 0x200000) break;
         if(memcmp(scan_buf + pg + page_off, sig, 16) == 0) {
           found_paddr = phys + pg + target_off;
           fprintf(fp, "  FOUND at physical page 0x%lx (PA of patch = 0x%lx)\n",
                   (unsigned long)(phys + pg), (unsigned long)found_paddr);
+          fprintf(fp, "  (scanned %d chunks OK, %d failed)\n", read_ok, read_fail);
           goto found_phys;
         }
       }
     }
 
-    fprintf(fp, "  Handler signature not found in first 2GB\n");
+    fprintf(fp, "  Handler signature not found (%d chunks OK, %d failed)\n",
+            read_ok, read_fail);
     free(scan_buf);
-    goto strategy3_done;
+    goto all_done;
 
 found_phys:
     free(scan_buf);
@@ -702,21 +737,18 @@ found_phys:
     intptr_t dmap_target = dmap_base + found_paddr;
     fprintf(fp, "  DMAP target = 0x%lx\n", (unsigned long)dmap_target);
 
-    /* Verify by reading through DMAP */
     unsigned char dmap_verify[2];
     kernel_copyout(dmap_target, dmap_verify, 2);
     fprintf(fp, "  DMAP read verify: %02x %02x (expect 74 07)\n",
             dmap_verify[0], dmap_verify[1]);
     if(dmap_verify[0] != 0x74 || dmap_verify[1] != 0x07) {
       fprintf(fp, "  DMAP read mismatch — wrong physical address\n");
-      goto strategy3_done;
+      goto all_done;
     }
 
-    /* Write NOPs through DMAP */
     unsigned char nops[2] = {0x90, 0x90};
     kernel_copyin(nops, dmap_target, 2);
 
-    /* Verify through original kernel VA */
     kernel_copyout(patch_addr, patch_bytes, 2);
     fprintf(fp, "  After DMAP write: %02x %02x\n", patch_bytes[0], patch_bytes[1]);
     if(patch_bytes[0] == 0x90 && patch_bytes[1] == 0x90)
@@ -724,7 +756,7 @@ found_phys:
     fprintf(fp, "  DMAP write did not stick\n");
   }
 
-strategy3_done:
+all_done:
   fprintf(fp, "\n  === ALL STRATEGIES EXHAUSTED ===\n");
   free(buf);
   return;

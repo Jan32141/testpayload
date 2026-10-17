@@ -364,83 +364,146 @@ found_string:
 
         oid_addr = found_at;
 
-        /* On PS5 FreeBSD, sysctl_oid likely has:
-         * offset 0x00: SLIST_ENTRY (2 pointers = 16 bytes)
-         * offset 0x10: oid_parent (pointer)
-         * offset 0x18: SLIST_ENTRY children (16 bytes)
-         * offset 0x28: oid_number (int)
-         * offset 0x2c: oid_kind (unsigned int)
-         * offset 0x30: oid_arg1 (void*)
-         * offset 0x38: oid_arg2 (intmax_t)
-         * offset 0x40: oid_name (char*)
-         * offset 0x48: oid_handler (function*)
-         * offset 0x50: oid_fmt (char*)
-         * offset 0x58: oid_refcnt
-         * offset 0x5c: oid_running
+        /* FreeBSD 11 sysctl_oid layout (0x60 bytes):
+         *   +0x00: oid_children  (SLIST_HEAD, 8 bytes)
+         *   +0x08: oid_parent    (ptr, 8 bytes)
+         *   +0x10: oid_link      (SLIST_ENTRY, 8 bytes)
+         *   +0x18: oid_number    (int, 4 bytes) + oid_kind (uint, 4 bytes)
+         *   +0x20: oid_arg1      (void*, 8 bytes)
+         *   +0x28: oid_arg2      (intmax_t, 8 bytes)
+         *   +0x30: oid_name      (char*, 8 bytes) <-- found_at points here
+         *   +0x38: oid_handler   (function ptr)
+         *   +0x40: oid_fmt       (char*)
+         *   +0x48: oid_refcnt(4) + oid_running(4)
+         *   +0x50: oid_descr     (char*)
+         *   +0x58: oid_label     (char*)
          *
-         * But the exact layout depends on the version.
-         * Let's try: if found_at is oid_name, then oid_arg1
-         * might be at found_at - 0x10 or found_at - 0x08. */
+         * Confirmed from dump: entries are 0x60 apart, oid_kind at
+         * name-0x18 = 0x80000002 = CTLTYPE_INT|CTLFLAG_RD.
+         *
+         * For sysctl_handle_int: if oid_arg1 is NULL, the value
+         * comes from oid_arg2 directly (not through a pointer). */
 
-        /* Actually let's try a different approach:
-         * Search the struct for a pointer to a kernel data address
-         * that currently contains the value 0 (the sysctl value).
-         * We look at every 8-byte aligned pointer in the struct. */
-        fprintf(fp, "\n  Looking for backing variable pointer...\n");
-        for(int field = -128; field < 128; field += 8) {
-          if(i + field < 0 || i + field + 8 > chunk_sz) continue;
-          intptr_t candidate = *(intptr_t *)&buf[i + field];
-          /* Must be a valid kernel data pointer */
-          if((candidate & 0xFFFFFF0000000000UL) != 0xFFFFFF0000000000UL)
-            continue;
-          if(candidate == string_addr) continue;
-          /* Read what it points to */
-          int32_t pointed_val = 0;
-          if(!kernel_copyout(candidate, &pointed_val, 4)) {
-            if(pointed_val == 0) {
-              fprintf(fp, "    Field at name%+d (0x%lx): ptr=0x%lx -> val=%d "
-                      "(candidate!)\n",
-                      field, (unsigned long)(kdata + off + i + field),
-                      (unsigned long)candidate, pointed_val);
-            }
-          }
-        }
+        intptr_t struct_base = found_at - 0x30;
+        fprintf(fp, "\n  sysctl_oid base = 0x%lx\n",
+                (unsigned long)struct_base);
 
-        /* Try brute force: just find the oid_arg1 by trying each pointer
-         * and writing 1 to what it points to, then checking the sysctl */
-        fprintf(fp, "\n  Trying to find and patch backing variable...\n");
-        for(int field = -64; field < 64; field += 8) {
-          if(i + field < 0 || i + field + 8 > chunk_sz) continue;
-          intptr_t candidate = *(intptr_t *)&buf[i + field];
-          if((candidate & 0xFFFFFF0000000000UL) != 0xFFFFFF0000000000UL)
-            continue;
-          if(candidate == string_addr) continue;
+        /* Read oid_arg1 and oid_arg2 */
+        intptr_t oid_arg1 = 0;
+        int64_t oid_arg2 = 0;
+        uint32_t oid_kind = 0;
+        kernel_copyout(struct_base + 0x18 + 4, &oid_kind, 4);
+        kernel_copyout(struct_base + 0x20, &oid_arg1, 8);
+        kernel_copyout(struct_base + 0x28, &oid_arg2, 8);
 
-          int32_t pointed_val = 0;
-          if(kernel_copyout(candidate, &pointed_val, 4)) continue;
-          if(pointed_val != 0) continue;
+        fprintf(fp, "  oid_kind = 0x%08x\n", oid_kind);
+        fprintf(fp, "  oid_arg1 = 0x%lx%s\n", (unsigned long)oid_arg1,
+                oid_arg1 == 0 ? " (NULL - value in arg2)" : "");
+        fprintf(fp, "  oid_arg2 = %ld (0x%lx)\n", (long)oid_arg2,
+                (unsigned long)oid_arg2);
 
-          /* Found a kernel pointer that holds 0. Try setting it to 1. */
-          fprintf(fp, "    Trying field at name%+d: ptr=0x%lx (was 0)\n",
-                  field, (unsigned long)candidate);
-          kernel_setchar(candidate, 1);
+        if(oid_arg1 == 0) {
+          /* Value is stored inline in oid_arg2. Write 1 there. */
+          intptr_t arg2_addr = struct_base + 0x28;
+          fprintf(fp, "\n  Patching oid_arg2 at 0x%lx: 0 -> 1\n",
+                  (unsigned long)arg2_addr);
+          int32_t one = 1;
+          kernel_copyin(&one, arg2_addr, 4);
 
-          /* Check if sysctl changed */
           int check = -1;
           size_t clen = sizeof(check);
           sysctlbyname("machdep.check_genuine_devkit_for_psm",
                         &check, &clen, NULL, 0);
-          fprintf(fp, "      machdep.check_genuine_devkit_for_psm = %d\n", check);
+          fprintf(fp, "  After patch: machdep.check_genuine_devkit_for_psm = %d\n",
+                  check);
 
           if(check == 1) {
-            fprintf(fp, "      *** SUCCESS! Found backing variable at 0x%lx ***\n",
-                    (unsigned long)candidate);
+            fprintf(fp, "  *** SUCCESS! sysctl patched via oid_arg2 ***\n");
             goto patched;
           }
 
-          /* Revert */
-          kernel_setchar(candidate, 0);
+          /* If that didn't work, maybe the layout is different.
+           * Try writing to the 8 bytes before name (name-8) directly */
+          fprintf(fp, "  arg2 patch didn't change sysctl, trying name-8...\n");
+          intptr_t alt_addr = found_at - 8;
+          kernel_copyin(&one, alt_addr, 4);
+
+          check = -1;
+          clen = sizeof(check);
+          sysctlbyname("machdep.check_genuine_devkit_for_psm",
+                        &check, &clen, NULL, 0);
+          fprintf(fp, "  After name-8 patch: value = %d\n", check);
+
+          if(check == 1) {
+            fprintf(fp, "  *** SUCCESS! sysctl patched at name-8 ***\n");
+            goto patched;
+          }
+
+          /* Also try name-16 (oid_arg1 offset in some layouts) */
+          fprintf(fp, "  Trying name-16...\n");
+          alt_addr = found_at - 16;
+          kernel_copyin(&one, alt_addr, 4);
+
+          check = -1;
+          clen = sizeof(check);
+          sysctlbyname("machdep.check_genuine_devkit_for_psm",
+                        &check, &clen, NULL, 0);
+          fprintf(fp, "  After name-16 patch: value = %d\n", check);
+
+          if(check == 1) {
+            fprintf(fp, "  *** SUCCESS! sysctl patched at name-16 ***\n");
+            goto patched;
+          }
+
+          /* Revert name-16 if it didn't work */
+          int32_t zero = 0;
+          kernel_copyin(&zero, found_at - 16, 4);
+        } else {
+          /* Value is behind a pointer in oid_arg1. Write 1 there. */
+          fprintf(fp, "\n  Patching *oid_arg1 at 0x%lx: val -> 1\n",
+                  (unsigned long)oid_arg1);
+          int32_t one = 1;
+          kernel_copyin(&one, oid_arg1, 4);
+
+          int check = -1;
+          size_t clen = sizeof(check);
+          sysctlbyname("machdep.check_genuine_devkit_for_psm",
+                        &check, &clen, NULL, 0);
+          fprintf(fp, "  After patch: machdep.check_genuine_devkit_for_psm = %d\n",
+                  check);
+
+          if(check == 1) {
+            fprintf(fp, "  *** SUCCESS! sysctl patched via *oid_arg1 ***\n");
+            goto patched;
+          }
         }
+
+        /* Also try making the sysctl writable by changing oid_kind
+         * from CTLFLAG_RD to CTLFLAG_RW, then writing via sysctlbyname */
+        fprintf(fp, "\n  Trying to make sysctl writable...\n");
+        uint32_t new_kind = (oid_kind & ~0xF0000000U) | 0xC0000000U;
+        fprintf(fp, "  Changing oid_kind 0x%08x -> 0x%08x\n", oid_kind, new_kind);
+        kernel_copyin(&new_kind, struct_base + 0x18 + 4, 4);
+
+        int new_val = 1;
+        int werr = sysctlbyname("machdep.check_genuine_devkit_for_psm",
+                        NULL, NULL, &new_val, sizeof(new_val));
+        fprintf(fp, "  sysctl write after kind change: err=%d errno=%d\n",
+                werr, errno);
+
+        int check2 = -1;
+        size_t clen2 = sizeof(check2);
+        sysctlbyname("machdep.check_genuine_devkit_for_psm",
+                      &check2, &clen2, NULL, 0);
+        fprintf(fp, "  After writable+write: value = %d\n", check2);
+
+        if(check2 == 1) {
+          fprintf(fp, "  *** SUCCESS! sysctl patched via writable mode ***\n");
+          goto patched;
+        }
+
+        /* Restore kind */
+        kernel_copyin(&oid_kind, struct_base + 0x18 + 4, 4);
 
         break;
       }

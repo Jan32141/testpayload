@@ -17,6 +17,7 @@
 #include <errno.h>
 
 #include <ps5/kernel.h>
+#include <ps5/iommu.h>
 
 #define OUT_DIR "/data/testpayload"
 
@@ -622,8 +623,45 @@ restore_handler:
   kernel_copyin(&orig_kind, struct_base + 0x1c, 4);
 
 try_code_patch:;
-  fprintf(fp, "\n  === ALL SAFE STRATEGIES EXHAUSTED ===\n");
-  fprintf(fp, "  (No text segment writes attempted)\n");
+  /* Strategy 3: IOMMU DMA write to patch handler TEXT.
+   * The real handler at +0x55 has: 74 07 (jz +7) which skips val=1.
+   * NOP it out (90 90) so val=1 is always set. */
+  printf("devkitact: phase 3e - IOMMU text patch\n");
+  fprintf(fp, "\n  === STRATEGY 3: IOMMU text patch (jz -> NOP NOP) ===\n");
+
+  intptr_t patch_addr = real_handler + 0x55;
+  unsigned char patch_bytes[2];
+  kernel_copyout(patch_addr, patch_bytes, 2);
+  fprintf(fp, "  real_handler+0x55: %02x %02x\n", patch_bytes[0], patch_bytes[1]);
+
+  if(patch_bytes[0] == 0x74 && patch_bytes[1] == 0x07) {
+    fprintf(fp, "  Confirmed jz +7 at patch target\n");
+    int r1 = kernel_iommu_setchar(patch_addr, (char)0x90);
+    int r2 = kernel_iommu_setchar(patch_addr + 1, (char)0x90);
+    fprintf(fp, "  IOMMU write 0x90 @ +0x55: ret=%d\n", r1);
+    fprintf(fp, "  IOMMU write 0x90 @ +0x56: ret=%d\n", r2);
+
+    kernel_copyout(patch_addr, patch_bytes, 2);
+    fprintf(fp, "  Verify: real_handler+0x55: %02x %02x\n",
+            patch_bytes[0], patch_bytes[1]);
+
+    if(patch_bytes[0] == 0x90 && patch_bytes[1] == 0x90) {
+      fprintf(fp, "  Text patch applied!\n");
+      check = -1; clen = sizeof(check);
+      sysctlbyname("machdep.check_genuine_devkit_for_psm", &check, &clen, NULL, 0);
+      fprintf(fp, "  machdep.check_genuine_devkit_for_psm = %d\n", check);
+      if(check == 1) {
+        fprintf(fp, "  *** SUCCESS via IOMMU text patch! ***\n");
+        goto patched;
+      }
+    } else {
+      fprintf(fp, "  IOMMU write did not stick\n");
+    }
+  } else {
+    fprintf(fp, "  Unexpected bytes (expected 74 07), skipping patch\n");
+  }
+
+  fprintf(fp, "\n  === ALL STRATEGIES EXHAUSTED ===\n");
   free(buf);
   return;
 

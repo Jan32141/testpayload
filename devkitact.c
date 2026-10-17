@@ -225,50 +225,21 @@ static void
 patch_sysctl_genuine_devkit(FILE *fp) {
   fprintf(fp, "\n=== SYSCTL GENUINE DEVKIT PATCH ===\n\n");
 
-  /* Current value */
   int cur_val = -1;
   size_t len = sizeof(cur_val);
   int err = sysctlbyname("machdep.check_genuine_devkit_for_psm",
                           &cur_val, &len, NULL, 0);
-  fprintf(fp, "  Current machdep.check_genuine_devkit_for_psm = %d "
-          "(err=%d)\n", cur_val, err);
-
-  if(err) {
-    fprintf(fp, "  ERROR: sysctl not available\n");
-    return;
-  }
-
-  /* Try to SET the sysctl directly (probably won't work without kernel priv) */
-  int new_val = 1;
-  err = sysctlbyname("machdep.check_genuine_devkit_for_psm",
-                      NULL, NULL, &new_val, sizeof(new_val));
-  fprintf(fp, "  Direct sysctl write attempt: err=%d errno=%d\n", err, errno);
-
-  /* Check if it changed */
-  cur_val = -1;
-  len = sizeof(cur_val);
-  sysctlbyname("machdep.check_genuine_devkit_for_psm", &cur_val, &len, NULL, 0);
-  fprintf(fp, "  After direct write: value = %d\n", cur_val);
-
-  if(cur_val == 1) {
-    fprintf(fp, "  SUCCESS: sysctl patched via direct write!\n");
-    return;
-  }
-
-  /* Direct write failed. Scan kernel data for the backing variable.
-   * The string "check_genuine_devkit_for_psm" should be in kernel rodata.
-   * We'll scan kernel data section to find it. */
-  fprintf(fp, "\n  Scanning kernel data for sysctl string...\n");
+  fprintf(fp, "  Current machdep.check_genuine_devkit_for_psm = %d (err=%d)\n",
+          cur_val, err);
+  if(err) { fprintf(fp, "  ERROR: sysctl not available\n"); return; }
 
   intptr_t kdata = KERNEL_ADDRESS_DATA_BASE;
-  if(!kdata) {
-    fprintf(fp, "  ERROR: kernel data base not available\n");
-    return;
+  intptr_t ktext = KERNEL_ADDRESS_TEXT_BASE;
+  if(!kdata || !ktext) {
+    fprintf(fp, "  ERROR: kernel base not available\n"); return;
   }
 
-  fprintf(fp, "  KERNEL_DATA_BASE = 0x%lx\n", (unsigned long)kdata);
-
-  /* Scan kernel data/rodata for "check_genuine_devkit_for_psm" string */
+  /* Find "check_genuine_devkit_for_psm" string in kernel data */
   const char *needle = "check_genuine_devkit_for_psm";
   size_t nlen = strlen(needle);
   size_t chunk_sz = 256 * 1024;
@@ -276,259 +247,270 @@ patch_sysctl_genuine_devkit(FILE *fp) {
   if(!buf) return;
 
   intptr_t string_addr = 0;
-
-  /* Scan up to 64MB of kernel data */
   for(size_t off = 0; off < 64UL * 1024 * 1024; off += chunk_sz) {
-    int ret = kernel_copyout(kdata + off, buf, chunk_sz);
-    if(ret) {
-      fprintf(fp, "  kernel_copyout at offset 0x%zx failed: %d\n", off, ret);
-      break;
-    }
-
+    if(kernel_copyout(kdata + off, buf, chunk_sz)) break;
     for(size_t i = 0; i + nlen < chunk_sz; i++) {
       if(!memcmp(&buf[i], needle, nlen) && buf[i + nlen] == 0) {
         string_addr = kdata + off + i;
-        fprintf(fp, "  Found \"%s\" at 0x%lx (kdata+0x%lx)\n",
-                needle, (unsigned long)string_addr,
-                (unsigned long)(string_addr - kdata));
-
-        /* Dump context around the string */
-        size_t ctx_start = (i >= 64) ? i - 64 : 0;
-        size_t ctx_end = (i + 128 < chunk_sz) ? i + 128 : chunk_sz;
-        for(size_t ci = ctx_start; ci < ctx_end; ci += 16) {
-          fprintf(fp, "    0x%lx: ", (unsigned long)(kdata + off + ci));
-          for(size_t cj = 0; cj < 16 && ci+cj < ctx_end; cj++)
-            fprintf(fp, "%02x ", buf[ci+cj]);
-          fprintf(fp, "\n");
-        }
         goto found_string;
       }
     }
   }
+  fprintf(fp, "  String not found\n"); free(buf); return;
 
-  fprintf(fp, "  String not found in kernel data (scanned 64MB)\n");
+found_string:
+  fprintf(fp, "  String at 0x%lx\n", (unsigned long)string_addr);
+
+  /* Find pointer to string (oid_name field in sysctl_oid) */
+  intptr_t name_addr = 0;
+  for(size_t off = 0; off < 64UL * 1024 * 1024; off += chunk_sz) {
+    if(kernel_copyout(kdata + off, buf, chunk_sz)) break;
+    for(size_t i = 0; i + 8 <= chunk_sz; i += 8) {
+      if(*(intptr_t *)&buf[i] == string_addr) {
+        name_addr = kdata + off + i;
+        goto found_oid;
+      }
+    }
+  }
+  fprintf(fp, "  sysctl_oid not found\n"); free(buf); return;
+
+found_oid:;
+  /* sysctl_oid layout: oid_name at +0x30, oid_handler at +0x38 */
+  intptr_t struct_base = name_addr - 0x30;
+  fprintf(fp, "  sysctl_oid @ 0x%lx\n", (unsigned long)struct_base);
+
+  intptr_t oid_handler = 0;
+  kernel_copyout(struct_base + 0x38, &oid_handler, 8);
+  fprintf(fp, "  oid_handler = 0x%lx\n", (unsigned long)oid_handler);
+
+  /* Dump handler code (128 bytes) */
+  fprintf(fp, "\n  Handler code at 0x%lx:\n", (unsigned long)oid_handler);
+  unsigned char hcode[128];
+  if(!kernel_copyout(oid_handler, hcode, sizeof(hcode))) {
+    for(int row = 0; row < 128; row += 16) {
+      fprintf(fp, "    +%02x: ", row);
+      for(int c = 0; c < 16; c++)
+        fprintf(fp, "%02x ", hcode[row + c]);
+      fprintf(fp, "\n");
+    }
+  } else {
+    fprintf(fp, "    (cannot read handler code)\n");
+  }
+
+  /* Find sysctl_handle_int by looking at a known standard sysctl.
+   * kern.osreldate is a CTLTYPE_INT that uses sysctl_handle_int.
+   * We find it by scanning for the string "osreldate". */
+  fprintf(fp, "\n  Searching for sysctl_handle_int via kern.osreldate...\n");
+
+  intptr_t std_handler = 0;
+  const char *ref_needle = "osreldate";
+  size_t ref_nlen = strlen(ref_needle);
+  intptr_t ref_string = 0;
+
+  for(size_t off = 0; off < 64UL * 1024 * 1024; off += chunk_sz) {
+    if(kernel_copyout(kdata + off, buf, chunk_sz)) break;
+    for(size_t i = 0; i + ref_nlen < chunk_sz; i++) {
+      if(!memcmp(&buf[i], ref_needle, ref_nlen) && buf[i + ref_nlen] == 0) {
+        /* Make sure it's exactly "osreldate" not a substring */
+        if(i > 0 && buf[i-1] != 0) continue;
+        ref_string = kdata + off + i;
+        goto found_ref_string;
+      }
+    }
+  }
+  fprintf(fp, "  Could not find osreldate string\n");
+  goto try_handler_patch;
+
+found_ref_string:
+  fprintf(fp, "  osreldate string at 0x%lx\n", (unsigned long)ref_string);
+
+  for(size_t off = 0; off < 64UL * 1024 * 1024; off += chunk_sz) {
+    if(kernel_copyout(kdata + off, buf, chunk_sz)) break;
+    for(size_t i = 0; i + 8 <= chunk_sz; i += 8) {
+      if(*(intptr_t *)&buf[i] == ref_string) {
+        intptr_t ref_name_addr = kdata + off + i;
+        intptr_t ref_base = ref_name_addr - 0x30;
+        kernel_copyout(ref_base + 0x38, &std_handler, 8);
+        fprintf(fp, "  osreldate sysctl_oid @ 0x%lx, handler = 0x%lx\n",
+                (unsigned long)ref_base, (unsigned long)std_handler);
+
+        /* Dump its code too for comparison */
+        unsigned char scode[64];
+        if(!kernel_copyout(std_handler, scode, sizeof(scode))) {
+          fprintf(fp, "  sysctl_handle_int code:\n    ");
+          for(int c = 0; c < 32; c++)
+            fprintf(fp, "%02x ", scode[c]);
+          fprintf(fp, "\n    ");
+          for(int c = 32; c < 64; c++)
+            fprintf(fp, "%02x ", scode[c]);
+          fprintf(fp, "\n");
+        }
+        goto found_std_handler;
+      }
+    }
+  }
+  fprintf(fp, "  Could not find osreldate sysctl_oid\n");
+  goto try_handler_patch;
+
+found_std_handler:
+  fprintf(fp, "\n  === HANDLER SWAP: custom -> sysctl_handle_int ===\n");
+  fprintf(fp, "  Setting oid_arg1=NULL, oid_arg2=1, handler=0x%lx\n",
+          (unsigned long)std_handler);
+
+  /* Set oid_arg2 = 1 (value to return) */
+  int64_t arg2_val = 1;
+  kernel_copyin(&arg2_val, struct_base + 0x28, 8);
+
+  /* Ensure oid_arg1 = NULL */
+  intptr_t null_ptr = 0;
+  kernel_copyin(&null_ptr, struct_base + 0x20, 8);
+
+  /* Swap handler to sysctl_handle_int */
+  kernel_copyin(&std_handler, struct_base + 0x38, 8);
+
+  /* Also make it RW so we can verify */
+  uint32_t rw_kind = 0xC0000002; /* CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_WR */
+  kernel_copyin(&rw_kind, struct_base + 0x18 + 4, 4);
+
+  int check = -1;
+  size_t clen = sizeof(check);
+  sysctlbyname("machdep.check_genuine_devkit_for_psm", &check, &clen, NULL, 0);
+  fprintf(fp, "  After handler swap: machdep.check_genuine_devkit_for_psm = %d\n",
+          check);
+
+  if(check == 1) {
+    fprintf(fp, "  *** SUCCESS! sysctl patched via handler swap ***\n");
+    goto patched;
+  }
+
+  fprintf(fp, "  Handler swap didn't work, handler may use different offset\n");
+
+  /* Try other possible handler offsets in the struct */
+  int offsets_to_try[] = { 0x28, 0x38, 0x40, 0x48 };
+  for(int t = 0; t < 4; t++) {
+    int hoff = offsets_to_try[t];
+    if(hoff == 0x38) continue; /* already tried */
+
+    intptr_t test_handler = 0;
+    kernel_copyout(struct_base + hoff, &test_handler, 8);
+    if(test_handler == oid_handler) {
+      fprintf(fp, "  Found handler at struct+0x%x too, swapping\n", hoff);
+      kernel_copyin(&std_handler, struct_base + hoff, 8);
+
+      check = -1;
+      clen = sizeof(check);
+      sysctlbyname("machdep.check_genuine_devkit_for_psm",
+                    &check, &clen, NULL, 0);
+      fprintf(fp, "  After swap at +0x%x: value = %d\n", hoff, check);
+      if(check == 1) {
+        fprintf(fp, "  *** SUCCESS! ***\n");
+        goto patched;
+      }
+    }
+  }
+
+try_handler_patch:
+  /* Last resort: patch the handler function itself.
+   * A sysctl handler signature is:
+   *   int handler(struct sysctl_oid *oidp, void *arg1,
+   *               intmax_t arg2, struct sysctl_req *req)
+   * The handler calls sysctl_handle_int internally.
+   * We look for patterns in the handler code that produce the 0 return. */
+  fprintf(fp, "\n  === DIRECT HANDLER CODE ANALYSIS ===\n");
+
+  if(kernel_copyout(oid_handler, hcode, sizeof(hcode))) {
+    fprintf(fp, "  Cannot read handler code\n");
+    goto done;
+  }
+
+  /* Look for xor eax,eax (31 c0) or mov eax,0 (b8 00 00 00 00)
+   * near the end of the function (before ret c3).
+   * These are where the handler sets the return value to 0.
+   * Also look for mov dword ptr [rbp-XX], 0 patterns which
+   * set a local variable to 0 before passing to sysctl_handle_int.
+   *
+   * Common pattern in custom handlers:
+   *   mov dword ptr [rbp-N], 0    ; val = 0
+   *   lea rsi, [rbp-N]            ; &val
+   *   mov edx, 4                  ; sizeof(int)
+   *   ...
+   *   call sysctl_handle_int / SYSCTL_OUT
+   *
+   * We want to change the 0 to 1. */
+
+  /* Find c7 45 XX 00 00 00 00 (mov dword [rbp-XX], 0) and change to 1 */
+  int patched_handler = 0;
+  for(int pc = 0; pc < 120; pc++) {
+    /* mov dword ptr [rbp+disp8], 0 = c7 45 XX 00 00 00 00 */
+    if(hcode[pc] == 0xc7 && hcode[pc+1] == 0x45 &&
+       hcode[pc+3] == 0x00 && hcode[pc+4] == 0x00 &&
+       hcode[pc+5] == 0x00 && hcode[pc+6] == 0x00) {
+      fprintf(fp, "  Found 'mov dword [rbp%+d], 0' at handler+0x%x\n",
+              (int8_t)hcode[pc+2], pc);
+      unsigned char patch = 0x01;
+      kernel_copyin(&patch, oid_handler + pc + 3, 1);
+      patched_handler = 1;
+
+      int check3 = -1;
+      size_t clen3 = sizeof(check3);
+      sysctlbyname("machdep.check_genuine_devkit_for_psm",
+                    &check3, &clen3, NULL, 0);
+      fprintf(fp, "  After handler code patch: value = %d\n", check3);
+      if(check3 == 1) {
+        fprintf(fp, "  *** SUCCESS! Handler code patched ***\n");
+        goto patched;
+      }
+    }
+    /* mov dword ptr [rsp+disp8], 0 = c7 44 24 XX 00 00 00 00 */
+    if(pc < 119 && hcode[pc] == 0xc7 && hcode[pc+1] == 0x44 &&
+       hcode[pc+2] == 0x24 &&
+       hcode[pc+4] == 0x00 && hcode[pc+5] == 0x00 &&
+       hcode[pc+6] == 0x00 && hcode[pc+7] == 0x00) {
+      fprintf(fp, "  Found 'mov dword [rsp+0x%02x], 0' at handler+0x%x\n",
+              hcode[pc+3], pc);
+      unsigned char patch = 0x01;
+      kernel_copyin(&patch, oid_handler + pc + 4, 1);
+      patched_handler = 1;
+
+      int check3 = -1;
+      size_t clen3 = sizeof(check3);
+      sysctlbyname("machdep.check_genuine_devkit_for_psm",
+                    &check3, &clen3, NULL, 0);
+      fprintf(fp, "  After handler code patch: value = %d\n", check3);
+      if(check3 == 1) {
+        fprintf(fp, "  *** SUCCESS! Handler code patched ***\n");
+        goto patched;
+      }
+    }
+    /* xor eax,eax (31 c0) followed soon by a call or ret -
+     * this might set the value before SYSCTL_OUT */
+    if(hcode[pc] == 0x31 && hcode[pc+1] == 0xc0 && !patched_handler) {
+      fprintf(fp, "  Found 'xor eax,eax' at handler+0x%x\n", pc);
+    }
+  }
+
+  /* Also dump the handler's full disassembly as hex for analysis */
+  fprintf(fp, "\n  Full handler hex (256 bytes):\n");
+  unsigned char hcode2[256];
+  kernel_copyout(oid_handler, hcode2, sizeof(hcode2));
+  for(int row = 0; row < 256; row += 16) {
+    fprintf(fp, "    +%02x: ", row);
+    for(int c = 0; c < 16; c++)
+      fprintf(fp, "%02x ", hcode2[row + c]);
+    fprintf(fp, "\n");
+  }
+
   free(buf);
   return;
 
-found_string:
-  /* Now scan kernel data for pointers to this string.
-   * A sysctl_oid struct has the name string pointer.
-   * On FreeBSD, struct sysctl_oid has:
-   *   ... various fields ...
-   *   char *oid_name;     (pointer to our string)
-   *   int oid_number;
-   *   ... */
-  fprintf(fp, "\n  Scanning for pointers to string at 0x%lx...\n",
-          (unsigned long)string_addr);
-
-  intptr_t oid_addr = 0;
-
-  for(size_t off = 0; off < 64UL * 1024 * 1024; off += chunk_sz) {
-    int ret = kernel_copyout(kdata + off, buf, chunk_sz);
-    if(ret) break;
-
-    for(size_t i = 0; i + 8 <= chunk_sz; i += 8) {
-      intptr_t ptr = *(intptr_t *)&buf[i];
-      if(ptr == string_addr) {
-        intptr_t found_at = kdata + off + i;
-        fprintf(fp, "  Pointer to string found at 0x%lx (kdata+0x%lx)\n",
-                (unsigned long)found_at, (unsigned long)(found_at - kdata));
-
-        /* This is likely the oid_name field of sysctl_oid.
-         * On FreeBSD, the struct layout varies by version but
-         * the key fields around oid_name are:
-         *   oid_handler (function pointer)
-         *   oid_fmt
-         *   oid_arg1 (void* - for integers, points to the variable)
-         *   oid_arg2 (int - for integers, stores the value or size)
-         *   oid_name
-         *   oid_number
-         *
-         * Let's dump 256 bytes around this pointer to analyze the struct. */
-
-        size_t dump_start = (i >= 128) ? i - 128 : 0;
-        size_t dump_end = (i + 128 < chunk_sz) ? i + 128 : chunk_sz;
-        fprintf(fp, "\n  Struct dump around name pointer:\n");
-        for(size_t di = dump_start; di < dump_end; di += 8) {
-          intptr_t val = *(intptr_t *)&buf[di];
-          fprintf(fp, "    0x%lx: %016lx",
-                  (unsigned long)(kdata + off + di),
-                  (unsigned long)val);
-          /* Annotate if this looks like a kernel pointer */
-          if((val & 0xFFFFFF0000000000UL) == 0xFFFFFF0000000000UL)
-            fprintf(fp, "  <- kernel ptr");
-          if(val == string_addr)
-            fprintf(fp, "  <- oid_name");
-          fprintf(fp, "\n");
-        }
-
-        oid_addr = found_at;
-
-        /* FreeBSD 11 sysctl_oid layout (0x60 bytes):
-         *   +0x00: oid_children  (SLIST_HEAD, 8 bytes)
-         *   +0x08: oid_parent    (ptr, 8 bytes)
-         *   +0x10: oid_link      (SLIST_ENTRY, 8 bytes)
-         *   +0x18: oid_number    (int, 4 bytes) + oid_kind (uint, 4 bytes)
-         *   +0x20: oid_arg1      (void*, 8 bytes)
-         *   +0x28: oid_arg2      (intmax_t, 8 bytes)
-         *   +0x30: oid_name      (char*, 8 bytes) <-- found_at points here
-         *   +0x38: oid_handler   (function ptr)
-         *   +0x40: oid_fmt       (char*)
-         *   +0x48: oid_refcnt(4) + oid_running(4)
-         *   +0x50: oid_descr     (char*)
-         *   +0x58: oid_label     (char*)
-         *
-         * Confirmed from dump: entries are 0x60 apart, oid_kind at
-         * name-0x18 = 0x80000002 = CTLTYPE_INT|CTLFLAG_RD.
-         *
-         * For sysctl_handle_int: if oid_arg1 is NULL, the value
-         * comes from oid_arg2 directly (not through a pointer). */
-
-        intptr_t struct_base = found_at - 0x30;
-        fprintf(fp, "\n  sysctl_oid base = 0x%lx\n",
-                (unsigned long)struct_base);
-
-        /* Read oid_arg1 and oid_arg2 */
-        intptr_t oid_arg1 = 0;
-        int64_t oid_arg2 = 0;
-        uint32_t oid_kind = 0;
-        kernel_copyout(struct_base + 0x18 + 4, &oid_kind, 4);
-        kernel_copyout(struct_base + 0x20, &oid_arg1, 8);
-        kernel_copyout(struct_base + 0x28, &oid_arg2, 8);
-
-        fprintf(fp, "  oid_kind = 0x%08x\n", oid_kind);
-        fprintf(fp, "  oid_arg1 = 0x%lx%s\n", (unsigned long)oid_arg1,
-                oid_arg1 == 0 ? " (NULL - value in arg2)" : "");
-        fprintf(fp, "  oid_arg2 = %ld (0x%lx)\n", (long)oid_arg2,
-                (unsigned long)oid_arg2);
-
-        if(oid_arg1 == 0) {
-          /* Value is stored inline in oid_arg2. Write 1 there. */
-          intptr_t arg2_addr = struct_base + 0x28;
-          fprintf(fp, "\n  Patching oid_arg2 at 0x%lx: 0 -> 1\n",
-                  (unsigned long)arg2_addr);
-          int32_t one = 1;
-          kernel_copyin(&one, arg2_addr, 4);
-
-          int check = -1;
-          size_t clen = sizeof(check);
-          sysctlbyname("machdep.check_genuine_devkit_for_psm",
-                        &check, &clen, NULL, 0);
-          fprintf(fp, "  After patch: machdep.check_genuine_devkit_for_psm = %d\n",
-                  check);
-
-          if(check == 1) {
-            fprintf(fp, "  *** SUCCESS! sysctl patched via oid_arg2 ***\n");
-            goto patched;
-          }
-
-          /* If that didn't work, maybe the layout is different.
-           * Try writing to the 8 bytes before name (name-8) directly */
-          fprintf(fp, "  arg2 patch didn't change sysctl, trying name-8...\n");
-          intptr_t alt_addr = found_at - 8;
-          kernel_copyin(&one, alt_addr, 4);
-
-          check = -1;
-          clen = sizeof(check);
-          sysctlbyname("machdep.check_genuine_devkit_for_psm",
-                        &check, &clen, NULL, 0);
-          fprintf(fp, "  After name-8 patch: value = %d\n", check);
-
-          if(check == 1) {
-            fprintf(fp, "  *** SUCCESS! sysctl patched at name-8 ***\n");
-            goto patched;
-          }
-
-          /* Also try name-16 (oid_arg1 offset in some layouts) */
-          fprintf(fp, "  Trying name-16...\n");
-          alt_addr = found_at - 16;
-          kernel_copyin(&one, alt_addr, 4);
-
-          check = -1;
-          clen = sizeof(check);
-          sysctlbyname("machdep.check_genuine_devkit_for_psm",
-                        &check, &clen, NULL, 0);
-          fprintf(fp, "  After name-16 patch: value = %d\n", check);
-
-          if(check == 1) {
-            fprintf(fp, "  *** SUCCESS! sysctl patched at name-16 ***\n");
-            goto patched;
-          }
-
-          /* Revert name-16 if it didn't work */
-          int32_t zero = 0;
-          kernel_copyin(&zero, found_at - 16, 4);
-        } else {
-          /* Value is behind a pointer in oid_arg1. Write 1 there. */
-          fprintf(fp, "\n  Patching *oid_arg1 at 0x%lx: val -> 1\n",
-                  (unsigned long)oid_arg1);
-          int32_t one = 1;
-          kernel_copyin(&one, oid_arg1, 4);
-
-          int check = -1;
-          size_t clen = sizeof(check);
-          sysctlbyname("machdep.check_genuine_devkit_for_psm",
-                        &check, &clen, NULL, 0);
-          fprintf(fp, "  After patch: machdep.check_genuine_devkit_for_psm = %d\n",
-                  check);
-
-          if(check == 1) {
-            fprintf(fp, "  *** SUCCESS! sysctl patched via *oid_arg1 ***\n");
-            goto patched;
-          }
-        }
-
-        /* Also try making the sysctl writable by changing oid_kind
-         * from CTLFLAG_RD to CTLFLAG_RW, then writing via sysctlbyname */
-        fprintf(fp, "\n  Trying to make sysctl writable...\n");
-        uint32_t new_kind = (oid_kind & ~0xF0000000U) | 0xC0000000U;
-        fprintf(fp, "  Changing oid_kind 0x%08x -> 0x%08x\n", oid_kind, new_kind);
-        kernel_copyin(&new_kind, struct_base + 0x18 + 4, 4);
-
-        int new_val = 1;
-        int werr = sysctlbyname("machdep.check_genuine_devkit_for_psm",
-                        NULL, NULL, &new_val, sizeof(new_val));
-        fprintf(fp, "  sysctl write after kind change: err=%d errno=%d\n",
-                werr, errno);
-
-        int check2 = -1;
-        size_t clen2 = sizeof(check2);
-        sysctlbyname("machdep.check_genuine_devkit_for_psm",
-                      &check2, &clen2, NULL, 0);
-        fprintf(fp, "  After writable+write: value = %d\n", check2);
-
-        if(check2 == 1) {
-          fprintf(fp, "  *** SUCCESS! sysctl patched via writable mode ***\n");
-          goto patched;
-        }
-
-        /* Restore kind */
-        kernel_copyin(&oid_kind, struct_base + 0x18 + 4, 4);
-
-        break;
-      }
-    }
-    if(oid_addr) break;
-  }
-
-  if(!oid_addr) {
-    fprintf(fp, "  No pointer to string found\n");
-  }
-
+done:
   free(buf);
   return;
 
 patched:
   free(buf);
-
   fprintf(fp, "\n=== SYSCTL PATCHED SUCCESSFULLY ===\n");
   fprintf(fp, "  machdep.check_genuine_devkit_for_psm = 1\n");
-
-  /* Also ensure IsDevKit stubs are patched */
-  fprintf(fp, "\n  Post-patch checks:\n");
-  fprintf(fp, "    sceKernelIsDevKit()  = %d\n", sceKernelIsDevKit());
-  fprintf(fp, "    sceKernelIsTestKit() = %d\n", sceKernelIsTestKit());
-  fprintf(fp, "    sceKernelIsCEX()     = %d\n", sceKernelIsCEX());
 }
 
 /* Phase 4: Patch sceKernelIsDevKit in SceShellUI + SceShellCore */

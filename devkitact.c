@@ -221,6 +221,60 @@ try_set_dipsw_flags(FILE *fp) {
  * to the backing variable. We can find the string
  * "check_genuine_devkit_for_psm" in kernel data and use it to find
  * the sysctl_oid, then follow the pointer to the variable. */
+static intptr_t
+resolve_trampoline(intptr_t tramp_addr, FILE *fp) {
+  unsigned char code[8];
+  if(kernel_copyout(tramp_addr, code, 8)) return 0;
+  if(code[0] == 0xe9) {
+    int32_t rel = *(int32_t *)&code[1];
+    intptr_t target = tramp_addr + 5 + rel;
+    fprintf(fp, "  Trampoline at 0x%lx: jmp rel32 -> 0x%lx\n",
+            (unsigned long)tramp_addr, (unsigned long)target);
+    return target;
+  }
+  if(code[0] == 0xff && code[1] == 0x25) {
+    int32_t rip_off = *(int32_t *)&code[2];
+    intptr_t ptr_addr = tramp_addr + 6 + rip_off;
+    intptr_t target = 0;
+    kernel_copyout(ptr_addr, &target, 8);
+    fprintf(fp, "  Trampoline at 0x%lx: jmp [rip+0x%x] -> 0x%lx\n",
+            (unsigned long)tramp_addr, rip_off, (unsigned long)target);
+    return target;
+  }
+  fprintf(fp, "  Not a trampoline (first bytes: %02x %02x %02x %02x)\n",
+          code[0], code[1], code[2], code[3]);
+  return tramp_addr;
+}
+
+static int
+verify_write8(intptr_t addr, intptr_t expected, FILE *fp) {
+  intptr_t readback = 0;
+  kernel_copyout(addr, &readback, 8);
+  if(readback == expected) {
+    fprintf(fp, "  Write verified at 0x%lx = 0x%lx\n",
+            (unsigned long)addr, (unsigned long)expected);
+    return 1;
+  }
+  fprintf(fp, "  Write FAILED at 0x%lx: expected 0x%lx, got 0x%lx\n",
+          (unsigned long)addr, (unsigned long)expected,
+          (unsigned long)readback);
+  return 0;
+}
+
+static int
+verify_write4(intptr_t addr, uint32_t expected, FILE *fp) {
+  uint32_t readback = 0;
+  kernel_copyout(addr, &readback, 4);
+  if(readback == expected) {
+    fprintf(fp, "  Write verified at 0x%lx = 0x%x\n",
+            (unsigned long)addr, expected);
+    return 1;
+  }
+  fprintf(fp, "  Write FAILED at 0x%lx: expected 0x%x, got 0x%x\n",
+          (unsigned long)addr, expected, readback);
+  return 0;
+}
+
 static void
 patch_sysctl_genuine_devkit(FILE *fp) {
   fprintf(fp, "\n=== SYSCTL GENUINE DEVKIT PATCH ===\n\n");
@@ -239,7 +293,6 @@ patch_sysctl_genuine_devkit(FILE *fp) {
     fprintf(fp, "  ERROR: kernel base not available\n"); return;
   }
 
-  /* Find "check_genuine_devkit_for_psm" string in kernel data */
   const char *needle = "check_genuine_devkit_for_psm";
   size_t nlen = strlen(needle);
   size_t chunk_sz = 256 * 1024;
@@ -261,7 +314,6 @@ patch_sysctl_genuine_devkit(FILE *fp) {
 found_string:
   fprintf(fp, "  String at 0x%lx\n", (unsigned long)string_addr);
 
-  /* Find pointer to string (oid_name field in sysctl_oid) */
   intptr_t name_addr = 0;
   for(size_t off = 0; off < 64UL * 1024 * 1024; off += chunk_sz) {
     if(kernel_copyout(kdata + off, buf, chunk_sz)) break;
@@ -275,34 +327,39 @@ found_string:
   fprintf(fp, "  sysctl_oid not found\n"); free(buf); return;
 
 found_oid:;
-  /* sysctl_oid layout: oid_name at +0x30, oid_handler at +0x38 */
   intptr_t struct_base = name_addr - 0x30;
   fprintf(fp, "  sysctl_oid @ 0x%lx\n", (unsigned long)struct_base);
 
-  intptr_t oid_handler = 0;
-  kernel_copyout(struct_base + 0x38, &oid_handler, 8);
-  fprintf(fp, "  oid_handler = 0x%lx\n", (unsigned long)oid_handler);
+  intptr_t oid_handler_tramp = 0;
+  kernel_copyout(struct_base + 0x38, &oid_handler_tramp, 8);
+  fprintf(fp, "  oid_handler (trampoline) = 0x%lx\n",
+          (unsigned long)oid_handler_tramp);
 
-  /* Dump handler code (128 bytes) */
-  fprintf(fp, "\n  Handler code at 0x%lx:\n", (unsigned long)oid_handler);
-  unsigned char hcode[128];
-  if(!kernel_copyout(oid_handler, hcode, sizeof(hcode))) {
-    for(int row = 0; row < 128; row += 16) {
-      fprintf(fp, "    +%02x: ", row);
-      for(int c = 0; c < 16; c++)
-        fprintf(fp, "%02x ", hcode[row + c]);
-      fprintf(fp, "\n");
-    }
-  } else {
-    fprintf(fp, "    (cannot read handler code)\n");
+  intptr_t real_handler = resolve_trampoline(oid_handler_tramp, fp);
+  if(!real_handler) {
+    fprintf(fp, "  ERROR: cannot resolve handler trampoline\n");
+    free(buf); return;
   }
 
-  /* Find sysctl_handle_int by looking at a known standard sysctl.
-   * kern.osreldate is a CTLTYPE_INT that uses sysctl_handle_int.
-   * We find it by scanning for the string "osreldate". */
-  fprintf(fp, "\n  Searching for sysctl_handle_int via kern.osreldate...\n");
+  /* Dump 512 bytes of REAL handler code */
+  fprintf(fp, "\n  === REAL HANDLER CODE at 0x%lx ===\n",
+          (unsigned long)real_handler);
+  unsigned char rcode[512];
+  if(kernel_copyout(real_handler, rcode, sizeof(rcode))) {
+    fprintf(fp, "  Cannot read real handler code\n");
+    free(buf); return;
+  }
+  for(int row = 0; row < 512; row += 16) {
+    fprintf(fp, "    +%02x: ", row);
+    for(int c = 0; c < 16; c++)
+      fprintf(fp, "%02x ", rcode[row + c]);
+    fprintf(fp, "\n");
+  }
 
-  intptr_t std_handler = 0;
+  /* Find sysctl_handle_int via kern.osreldate */
+  fprintf(fp, "\n  === Finding sysctl_handle_int via kern.osreldate ===\n");
+  intptr_t std_handler_tramp = 0;
+  intptr_t real_std_handler = 0;
   const char *ref_needle = "osreldate";
   size_t ref_nlen = strlen(ref_needle);
   intptr_t ref_string = 0;
@@ -311,7 +368,6 @@ found_oid:;
     if(kernel_copyout(kdata + off, buf, chunk_sz)) break;
     for(size_t i = 0; i + ref_nlen < chunk_sz; i++) {
       if(!memcmp(&buf[i], ref_needle, ref_nlen) && buf[i + ref_nlen] == 0) {
-        /* Make sure it's exactly "osreldate" not a substring */
         if(i > 0 && buf[i-1] != 0) continue;
         ref_string = kdata + off + i;
         goto found_ref_string;
@@ -319,7 +375,7 @@ found_oid:;
     }
   }
   fprintf(fp, "  Could not find osreldate string\n");
-  goto try_handler_patch;
+  goto try_code_patch;
 
 found_ref_string:
   fprintf(fp, "  osreldate string at 0x%lx\n", (unsigned long)ref_string);
@@ -330,180 +386,258 @@ found_ref_string:
       if(*(intptr_t *)&buf[i] == ref_string) {
         intptr_t ref_name_addr = kdata + off + i;
         intptr_t ref_base = ref_name_addr - 0x30;
-        kernel_copyout(ref_base + 0x38, &std_handler, 8);
-        fprintf(fp, "  osreldate sysctl_oid @ 0x%lx, handler = 0x%lx\n",
-                (unsigned long)ref_base, (unsigned long)std_handler);
-
-        /* Dump its code too for comparison */
-        unsigned char scode[64];
-        if(!kernel_copyout(std_handler, scode, sizeof(scode))) {
-          fprintf(fp, "  sysctl_handle_int code:\n    ");
-          for(int c = 0; c < 32; c++)
-            fprintf(fp, "%02x ", scode[c]);
-          fprintf(fp, "\n    ");
-          for(int c = 32; c < 64; c++)
-            fprintf(fp, "%02x ", scode[c]);
-          fprintf(fp, "\n");
-        }
+        kernel_copyout(ref_base + 0x38, &std_handler_tramp, 8);
+        fprintf(fp, "  osreldate oid @ 0x%lx, handler tramp = 0x%lx\n",
+                (unsigned long)ref_base, (unsigned long)std_handler_tramp);
+        real_std_handler = resolve_trampoline(std_handler_tramp, fp);
+        fprintf(fp, "  REAL sysctl_handle_int = 0x%lx\n",
+                (unsigned long)real_std_handler);
         goto found_std_handler;
       }
     }
   }
   fprintf(fp, "  Could not find osreldate sysctl_oid\n");
-  goto try_handler_patch;
+  goto try_code_patch;
 
-found_std_handler:
-  fprintf(fp, "\n  === HANDLER SWAP: custom -> sysctl_handle_int ===\n");
-  fprintf(fp, "  Setting oid_arg1=NULL, oid_arg2=1, handler=0x%lx\n",
-          (unsigned long)std_handler);
+found_std_handler:;
+  /* Strategy A: Rewrite the trampoline jmp to point to sysctl_handle_int
+   * instead of the custom handler, AND set arg1=NULL, arg2=1.
+   * The trampoline entry is: e9 XX XX XX XX cc cc cc
+   * We rewrite the rel32 offset so it jumps to real_std_handler. */
+  fprintf(fp, "\n  === STRATEGY A: Rewrite trampoline jmp target ===\n");
 
-  /* Set oid_arg2 = 1 (value to return) */
+  intptr_t arg1_val = 0;
   int64_t arg2_val = 1;
+  kernel_copyin(&arg1_val, struct_base + 0x20, 8);
   kernel_copyin(&arg2_val, struct_base + 0x28, 8);
+  verify_write8(struct_base + 0x20, 0, fp);
+  verify_write8(struct_base + 0x28, 1, fp);
 
-  /* Ensure oid_arg1 = NULL */
-  intptr_t null_ptr = 0;
-  kernel_copyin(&null_ptr, struct_base + 0x20, 8);
-
-  /* Swap handler to sysctl_handle_int */
-  kernel_copyin(&std_handler, struct_base + 0x38, 8);
-
-  /* Also make it RW so we can verify */
-  uint32_t rw_kind = 0xC0000002; /* CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_WR */
+  uint32_t rw_kind = 0xC0000002;
   kernel_copyin(&rw_kind, struct_base + 0x18 + 4, 4);
+  verify_write4(struct_base + 0x18 + 4, rw_kind, fp);
+
+  int32_t new_rel32 = (int32_t)(real_std_handler - (oid_handler_tramp + 5));
+  fprintf(fp, "  Patching trampoline at 0x%lx+1: rel32 = 0x%x -> target 0x%lx\n",
+          (unsigned long)oid_handler_tramp, new_rel32,
+          (unsigned long)real_std_handler);
+
+  kernel_copyin(&new_rel32, oid_handler_tramp + 1, 4);
+
+  unsigned char tramp_check[8];
+  kernel_copyout(oid_handler_tramp, tramp_check, 8);
+  fprintf(fp, "  Trampoline after patch: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+          tramp_check[0], tramp_check[1], tramp_check[2], tramp_check[3],
+          tramp_check[4], tramp_check[5], tramp_check[6], tramp_check[7]);
+
+  intptr_t verify_target = resolve_trampoline(oid_handler_tramp, fp);
+  fprintf(fp, "  Trampoline now resolves to: 0x%lx (want 0x%lx)\n",
+          (unsigned long)verify_target, (unsigned long)real_std_handler);
 
   int check = -1;
   size_t clen = sizeof(check);
   sysctlbyname("machdep.check_genuine_devkit_for_psm", &check, &clen, NULL, 0);
-  fprintf(fp, "  After handler swap: machdep.check_genuine_devkit_for_psm = %d\n",
+  fprintf(fp, "  After trampoline rewrite: machdep.check_genuine_devkit_for_psm = %d\n",
           check);
 
   if(check == 1) {
-    fprintf(fp, "  *** SUCCESS! sysctl patched via handler swap ***\n");
+    fprintf(fp, "  *** SUCCESS via trampoline rewrite! ***\n");
     goto patched;
   }
 
-  fprintf(fp, "  Handler swap didn't work, handler may use different offset\n");
+  /* Strategy B: Write real sysctl_handle_int address directly to handler field
+   * (bypassing trampoline entirely) */
+  fprintf(fp, "\n  === STRATEGY B: Direct handler pointer to real function ===\n");
+  fprintf(fp, "  Writing real_std_handler 0x%lx to oid_handler at struct+0x38\n",
+          (unsigned long)real_std_handler);
+  kernel_copyin(&real_std_handler, struct_base + 0x38, 8);
+  verify_write8(struct_base + 0x38, real_std_handler, fp);
 
-  /* Try other possible handler offsets in the struct */
-  int offsets_to_try[] = { 0x28, 0x38, 0x40, 0x48 };
-  for(int t = 0; t < 4; t++) {
-    int hoff = offsets_to_try[t];
-    if(hoff == 0x38) continue; /* already tried */
+  check = -1;
+  clen = sizeof(check);
+  sysctlbyname("machdep.check_genuine_devkit_for_psm", &check, &clen, NULL, 0);
+  fprintf(fp, "  After direct handler write: value = %d\n", check);
 
-    intptr_t test_handler = 0;
-    kernel_copyout(struct_base + hoff, &test_handler, 8);
-    if(test_handler == oid_handler) {
-      fprintf(fp, "  Found handler at struct+0x%x too, swapping\n", hoff);
-      kernel_copyin(&std_handler, struct_base + hoff, 8);
+  if(check == 1) {
+    fprintf(fp, "  *** SUCCESS via direct handler pointer! ***\n");
+    goto patched;
+  }
 
-      check = -1;
-      clen = sizeof(check);
-      sysctlbyname("machdep.check_genuine_devkit_for_psm",
-                    &check, &clen, NULL, 0);
-      fprintf(fp, "  After swap at +0x%x: value = %d\n", hoff, check);
+  /* Restore handler pointer for strategy C */
+  kernel_copyin(&oid_handler_tramp, struct_base + 0x38, 8);
+
+try_code_patch:;
+  /* Strategy C: Patch the real handler code itself.
+   * The handler computes a value and passes it to sysctl_handle_int/SYSCTL_OUT.
+   * We scan for patterns that set a local var to 0 or return 0. */
+  fprintf(fp, "\n  === STRATEGY C: Patch real handler code ===\n");
+  fprintf(fp, "  Scanning 512 bytes of real handler at 0x%lx\n",
+          (unsigned long)real_handler);
+
+  int found_any = 0;
+  for(int pc = 0; pc < 500; pc++) {
+    /* c7 45 XX 00 00 00 00 = mov dword [rbp+disp8], 0 */
+    if(rcode[pc] == 0xc7 && rcode[pc+1] == 0x45 &&
+       rcode[pc+3] == 0x00 && rcode[pc+4] == 0x00 &&
+       rcode[pc+5] == 0x00 && rcode[pc+6] == 0x00) {
+      fprintf(fp, "  [%03x] mov dword [rbp%+d], 0 -> patching to 1\n",
+              pc, (int8_t)rcode[pc+2]);
+      unsigned char one = 0x01;
+      kernel_copyin(&one, real_handler + pc + 3, 1);
+      found_any = 1;
+
+      check = -1; clen = sizeof(check);
+      sysctlbyname("machdep.check_genuine_devkit_for_psm", &check, &clen, NULL, 0);
+      fprintf(fp, "    -> sysctl = %d\n", check);
       if(check == 1) {
-        fprintf(fp, "  *** SUCCESS! ***\n");
+        fprintf(fp, "  *** SUCCESS via handler code patch! ***\n");
         goto patched;
+      }
+      unsigned char zero = 0x00;
+      kernel_copyin(&zero, real_handler + pc + 3, 1);
+    }
+
+    /* c7 44 24 XX 00 00 00 00 = mov dword [rsp+disp8], 0 */
+    if(pc < 498 && rcode[pc] == 0xc7 && rcode[pc+1] == 0x44 &&
+       rcode[pc+2] == 0x24 &&
+       rcode[pc+4] == 0x00 && rcode[pc+5] == 0x00 &&
+       rcode[pc+6] == 0x00 && rcode[pc+7] == 0x00) {
+      fprintf(fp, "  [%03x] mov dword [rsp+0x%02x], 0 -> patching to 1\n",
+              pc, rcode[pc+3]);
+      unsigned char one = 0x01;
+      kernel_copyin(&one, real_handler + pc + 4, 1);
+      found_any = 1;
+
+      check = -1; clen = sizeof(check);
+      sysctlbyname("machdep.check_genuine_devkit_for_psm", &check, &clen, NULL, 0);
+      fprintf(fp, "    -> sysctl = %d\n", check);
+      if(check == 1) {
+        fprintf(fp, "  *** SUCCESS via handler code patch! ***\n");
+        goto patched;
+      }
+      unsigned char zero = 0x00;
+      kernel_copyin(&zero, real_handler + pc + 4, 1);
+    }
+
+    /* 31 c0 = xor eax, eax (followed by ret or leave) */
+    if(rcode[pc] == 0x31 && rcode[pc+1] == 0xc0) {
+      fprintf(fp, "  [%03x] xor eax,eax", pc);
+      if(pc + 2 < 512) fprintf(fp, " (next: %02x)", rcode[pc+2]);
+      fprintf(fp, "\n");
+    }
+
+    /* b8 00 00 00 00 = mov eax, 0 */
+    if(rcode[pc] == 0xb8 && rcode[pc+1] == 0x00 && rcode[pc+2] == 0x00 &&
+       rcode[pc+3] == 0x00 && rcode[pc+4] == 0x00) {
+      fprintf(fp, "  [%03x] mov eax, 0\n", pc);
+    }
+  }
+
+  /* Strategy D: Find calls within the real handler that might be
+   * sysctl_handle_int. Look for call rel32 (e8 XX XX XX XX). */
+  fprintf(fp, "\n  === STRATEGY D: Analyze calls in real handler ===\n");
+  for(int pc = 0; pc < 507; pc++) {
+    if(rcode[pc] == 0xe8) {
+      int32_t rel = *(int32_t *)&rcode[pc + 1];
+      intptr_t call_target = real_handler + pc + 5 + rel;
+      fprintf(fp, "  [%03x] call 0x%lx", pc, (unsigned long)call_target);
+      if(real_std_handler && call_target == real_std_handler)
+        fprintf(fp, " <-- sysctl_handle_int!");
+      fprintf(fp, "\n");
+    }
+  }
+
+  /* Strategy E: If the handler calls sysctl_handle_int, the value
+   * is typically loaded into a register or stack just before the call.
+   * Look for the call to sysctl_handle_int and patch what precedes it. */
+  if(real_std_handler) {
+    fprintf(fp, "\n  === STRATEGY E: Patch value before sysctl_handle_int call ===\n");
+    for(int pc = 0; pc < 507; pc++) {
+      if(rcode[pc] != 0xe8) continue;
+      int32_t rel = *(int32_t *)&rcode[pc + 1];
+      intptr_t call_target = real_handler + pc + 5 + rel;
+      if(call_target != real_std_handler) continue;
+
+      fprintf(fp, "  Found call to sysctl_handle_int at +0x%x\n", pc);
+      fprintf(fp, "  Preceding 32 bytes:\n    ");
+      int start = pc > 32 ? pc - 32 : 0;
+      for(int i = start; i < pc; i++)
+        fprintf(fp, "%02x ", rcode[i]);
+      fprintf(fp, "\n");
+
+      /* Look backward for lea rsi,[rbp+XX] or lea rsi,[rsp+XX] which
+       * is the pointer to the value passed to sysctl_handle_int.
+       * Then find what stored the value at that stack location. */
+      for(int back = pc - 1; back >= start; back--) {
+        /* 48 8d 75 XX = lea rsi, [rbp+disp8] */
+        if(back >= 3 && rcode[back-3] == 0x48 && rcode[back-2] == 0x8d &&
+           rcode[back-1] == 0x75) {
+          int8_t disp = (int8_t)rcode[back];
+          fprintf(fp, "  lea rsi,[rbp%+d] at +0x%x\n", disp, back-3);
+          /* Now find c7 45 <same disp> XX XX XX XX before this */
+          for(int s = back - 4; s >= start; s--) {
+            if(rcode[s] == 0xc7 && rcode[s+1] == 0x45 &&
+               (int8_t)rcode[s+2] == disp) {
+              int32_t imm = *(int32_t *)&rcode[s+3];
+              fprintf(fp, "  mov dword [rbp%+d], %d at +0x%x -> patching to 1\n",
+                      disp, imm, s);
+              unsigned char one = 0x01;
+              kernel_copyin(&one, real_handler + s + 3, 1);
+              unsigned char z3[3] = {0, 0, 0};
+              kernel_copyin(z3, real_handler + s + 4, 3);
+
+              check = -1; clen = sizeof(check);
+              sysctlbyname("machdep.check_genuine_devkit_for_psm",
+                            &check, &clen, NULL, 0);
+              fprintf(fp, "    -> sysctl = %d\n", check);
+              if(check == 1) {
+                fprintf(fp, "  *** SUCCESS! ***\n");
+                goto patched;
+              }
+              uint32_t orig = (uint32_t)imm;
+              kernel_copyin(&orig, real_handler + s + 3, 4);
+              break;
+            }
+          }
+        }
+        /* 48 8d 74 24 XX = lea rsi, [rsp+disp8] */
+        if(back >= 4 && rcode[back-4] == 0x48 && rcode[back-3] == 0x8d &&
+           rcode[back-2] == 0x74 && rcode[back-1] == 0x24) {
+          uint8_t disp = rcode[back];
+          fprintf(fp, "  lea rsi,[rsp+0x%02x] at +0x%x\n", disp, back-4);
+          for(int s = back - 5; s >= start; s--) {
+            if(rcode[s] == 0xc7 && rcode[s+1] == 0x44 &&
+               rcode[s+2] == 0x24 && rcode[s+3] == disp) {
+              int32_t imm = *(int32_t *)&rcode[s+4];
+              fprintf(fp, "  mov dword [rsp+0x%02x], %d at +0x%x -> patching to 1\n",
+                      disp, imm, s);
+              unsigned char one = 0x01;
+              kernel_copyin(&one, real_handler + s + 4, 1);
+              unsigned char z3[3] = {0, 0, 0};
+              kernel_copyin(z3, real_handler + s + 5, 3);
+
+              check = -1; clen = sizeof(check);
+              sysctlbyname("machdep.check_genuine_devkit_for_psm",
+                            &check, &clen, NULL, 0);
+              fprintf(fp, "    -> sysctl = %d\n", check);
+              if(check == 1) {
+                fprintf(fp, "  *** SUCCESS! ***\n");
+                goto patched;
+              }
+              uint32_t orig = (uint32_t)imm;
+              kernel_copyin(&orig, real_handler + s + 4, 4);
+              break;
+            }
+          }
+        }
       }
     }
   }
 
-try_handler_patch:
-  /* Last resort: patch the handler function itself.
-   * A sysctl handler signature is:
-   *   int handler(struct sysctl_oid *oidp, void *arg1,
-   *               intmax_t arg2, struct sysctl_req *req)
-   * The handler calls sysctl_handle_int internally.
-   * We look for patterns in the handler code that produce the 0 return. */
-  fprintf(fp, "\n  === DIRECT HANDLER CODE ANALYSIS ===\n");
+  if(!found_any)
+    fprintf(fp, "  No patchable patterns found\n");
 
-  if(kernel_copyout(oid_handler, hcode, sizeof(hcode))) {
-    fprintf(fp, "  Cannot read handler code\n");
-    goto done;
-  }
-
-  /* Look for xor eax,eax (31 c0) or mov eax,0 (b8 00 00 00 00)
-   * near the end of the function (before ret c3).
-   * These are where the handler sets the return value to 0.
-   * Also look for mov dword ptr [rbp-XX], 0 patterns which
-   * set a local variable to 0 before passing to sysctl_handle_int.
-   *
-   * Common pattern in custom handlers:
-   *   mov dword ptr [rbp-N], 0    ; val = 0
-   *   lea rsi, [rbp-N]            ; &val
-   *   mov edx, 4                  ; sizeof(int)
-   *   ...
-   *   call sysctl_handle_int / SYSCTL_OUT
-   *
-   * We want to change the 0 to 1. */
-
-  /* Find c7 45 XX 00 00 00 00 (mov dword [rbp-XX], 0) and change to 1 */
-  int patched_handler = 0;
-  for(int pc = 0; pc < 120; pc++) {
-    /* mov dword ptr [rbp+disp8], 0 = c7 45 XX 00 00 00 00 */
-    if(hcode[pc] == 0xc7 && hcode[pc+1] == 0x45 &&
-       hcode[pc+3] == 0x00 && hcode[pc+4] == 0x00 &&
-       hcode[pc+5] == 0x00 && hcode[pc+6] == 0x00) {
-      fprintf(fp, "  Found 'mov dword [rbp%+d], 0' at handler+0x%x\n",
-              (int8_t)hcode[pc+2], pc);
-      unsigned char patch = 0x01;
-      kernel_copyin(&patch, oid_handler + pc + 3, 1);
-      patched_handler = 1;
-
-      int check3 = -1;
-      size_t clen3 = sizeof(check3);
-      sysctlbyname("machdep.check_genuine_devkit_for_psm",
-                    &check3, &clen3, NULL, 0);
-      fprintf(fp, "  After handler code patch: value = %d\n", check3);
-      if(check3 == 1) {
-        fprintf(fp, "  *** SUCCESS! Handler code patched ***\n");
-        goto patched;
-      }
-    }
-    /* mov dword ptr [rsp+disp8], 0 = c7 44 24 XX 00 00 00 00 */
-    if(pc < 119 && hcode[pc] == 0xc7 && hcode[pc+1] == 0x44 &&
-       hcode[pc+2] == 0x24 &&
-       hcode[pc+4] == 0x00 && hcode[pc+5] == 0x00 &&
-       hcode[pc+6] == 0x00 && hcode[pc+7] == 0x00) {
-      fprintf(fp, "  Found 'mov dword [rsp+0x%02x], 0' at handler+0x%x\n",
-              hcode[pc+3], pc);
-      unsigned char patch = 0x01;
-      kernel_copyin(&patch, oid_handler + pc + 4, 1);
-      patched_handler = 1;
-
-      int check3 = -1;
-      size_t clen3 = sizeof(check3);
-      sysctlbyname("machdep.check_genuine_devkit_for_psm",
-                    &check3, &clen3, NULL, 0);
-      fprintf(fp, "  After handler code patch: value = %d\n", check3);
-      if(check3 == 1) {
-        fprintf(fp, "  *** SUCCESS! Handler code patched ***\n");
-        goto patched;
-      }
-    }
-    /* xor eax,eax (31 c0) followed soon by a call or ret -
-     * this might set the value before SYSCTL_OUT */
-    if(hcode[pc] == 0x31 && hcode[pc+1] == 0xc0 && !patched_handler) {
-      fprintf(fp, "  Found 'xor eax,eax' at handler+0x%x\n", pc);
-    }
-  }
-
-  /* Also dump the handler's full disassembly as hex for analysis */
-  fprintf(fp, "\n  Full handler hex (256 bytes):\n");
-  unsigned char hcode2[256];
-  kernel_copyout(oid_handler, hcode2, sizeof(hcode2));
-  for(int row = 0; row < 256; row += 16) {
-    fprintf(fp, "    +%02x: ", row);
-    for(int c = 0; c < 16; c++)
-      fprintf(fp, "%02x ", hcode2[row + c]);
-    fprintf(fp, "\n");
-  }
-
-  free(buf);
-  return;
-
-done:
+  fprintf(fp, "\n  === ALL STRATEGIES EXHAUSTED ===\n");
   free(buf);
   return;
 

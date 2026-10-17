@@ -400,123 +400,11 @@ found_ref_string:
   goto try_code_patch;
 
 found_std_handler:;
-  /* Strategy A: Write real sysctl_handle_int address directly to handler
-   * field in sysctl_oid (data segment, safe to write).
-   * Set arg1=NULL, arg2=1 so sysctl_handle_int returns 1.
-   * NOTE: Do NOT write to trampoline code (text segment) - causes panic. */
-  fprintf(fp, "\n  === STRATEGY A: Direct handler pointer swap ===\n");
+  /* === READ-ONLY ANALYSIS FIRST === */
+  printf("devkitact: phase 3a - analyzing handler calls\n");
 
-  intptr_t arg1_val = 0;
-  int64_t arg2_val = 1;
-  fprintf(fp, "  Setting oid_arg1=NULL, oid_arg2=1\n");
-  kernel_copyin(&arg1_val, struct_base + 0x20, 8);
-  kernel_copyin(&arg2_val, struct_base + 0x28, 8);
-  verify_write8(struct_base + 0x20, 0, fp);
-  verify_write8(struct_base + 0x28, 1, fp);
-
-  uint32_t rw_kind = 0xC0000002;
-  kernel_copyin(&rw_kind, struct_base + 0x18 + 4, 4);
-  verify_write4(struct_base + 0x18 + 4, rw_kind, fp);
-
-  /* Write REAL sysctl_handle_int (not trampoline) to handler field */
-  fprintf(fp, "  Writing real sysctl_handle_int 0x%lx to oid_handler\n",
-          (unsigned long)real_std_handler);
-  kernel_copyin(&real_std_handler, struct_base + 0x38, 8);
-  verify_write8(struct_base + 0x38, real_std_handler, fp);
-
-  int check = -1;
-  size_t clen = sizeof(check);
-  sysctlbyname("machdep.check_genuine_devkit_for_psm", &check, &clen, NULL, 0);
-  fprintf(fp, "  After direct handler swap: value = %d\n", check);
-
-  if(check == 1) {
-    fprintf(fp, "  *** SUCCESS via direct handler pointer! ***\n");
-    goto patched;
-  }
-
-  /* Strategy A2: Try writing osreldate's trampoline address instead.
-   * This worked before (returned 900000) - if the dispatch requires
-   * going through a trampoline, this confirms the mechanism. */
-  fprintf(fp, "\n  === STRATEGY A2: Write osreldate trampoline to handler ===\n");
-  fprintf(fp, "  Writing std_handler_tramp 0x%lx to oid_handler\n",
-          (unsigned long)std_handler_tramp);
-  kernel_copyin(&std_handler_tramp, struct_base + 0x38, 8);
-  verify_write8(struct_base + 0x38, std_handler_tramp, fp);
-
-  check = -1; clen = sizeof(check);
-  sysctlbyname("machdep.check_genuine_devkit_for_psm", &check, &clen, NULL, 0);
-  fprintf(fp, "  After osreldate trampoline swap: value = %d\n", check);
-
-  if(check == 1) {
-    fprintf(fp, "  *** SUCCESS! ***\n");
-    goto patched;
-  }
-
-  /* Restore original handler */
-  kernel_copyin(&oid_handler_tramp, struct_base + 0x38, 8);
-
-  /* Strategy A3: The handler might read the value from a global variable.
-   * Let's look at what the real handler actually does by examining if it
-   * reads from a fixed kernel data address. We search the handler for
-   * mov/lea with RIP-relative addressing that points to data segment. */
-  fprintf(fp, "\n  === STRATEGY A3: Find data references in real handler ===\n");
-  for(int pc = 0; pc < 500; pc++) {
-    /* Look for RIP-relative loads: XX XX XX XX [rip+disp32]
-     * Common patterns:
-     *   8b 05 XX XX XX XX = mov eax, [rip+disp32]
-     *   8b 0d XX XX XX XX = mov ecx, [rip+disp32]
-     *   48 8b XX XX XX XX XX = mov rXX, [rip+disp32]
-     *   48 8d XX XX XX XX XX = lea rXX, [rip+disp32] */
-
-    /* mov eax/ecx/edx/ebx, [rip+disp32] = 8b (00-1d) with modrm=05/0d/15/1d */
-    if(rcode[pc] == 0x8b && (rcode[pc+1] & 0xc7) == 0x05) {
-      int32_t disp = *(int32_t *)&rcode[pc+2];
-      intptr_t target = real_handler + pc + 6 + disp;
-      int reg = (rcode[pc+1] >> 3) & 7;
-      const char *rnames[] = {"eax","ecx","edx","ebx","esp","ebp","esi","edi"};
-      fprintf(fp, "  [%03x] mov %s, [rip+0x%x] -> 0x%lx",
-              pc, rnames[reg], disp, (unsigned long)target);
-      /* Read the value at that address */
-      if(target >= kdata && target < kdata + 64UL*1024*1024) {
-        int32_t val = 0;
-        kernel_copyout(target, &val, 4);
-        fprintf(fp, " (value=%d/0x%x)", val, val);
-        if(val == 0) {
-          fprintf(fp, " <- CANDIDATE! Trying patch to 1...");
-          int32_t one = 1;
-          kernel_copyin(&one, target, 4);
-          verify_write4(target, 1, fp);
-
-          int ch = -1; size_t cl = sizeof(ch);
-          sysctlbyname("machdep.check_genuine_devkit_for_psm", &ch, &cl, NULL, 0);
-          fprintf(fp, "\n    -> sysctl = %d\n", ch);
-          if(ch == 1) {
-            fprintf(fp, "  *** SUCCESS via data variable patch! ***\n");
-            goto patched;
-          }
-          int32_t z = 0;
-          kernel_copyin(&z, target, 4);
-        }
-      }
-      fprintf(fp, "\n");
-    }
-
-    /* 48 8b XX [rip+disp32] with REX.W prefix */
-    if(rcode[pc] == 0x48 && rcode[pc+1] == 0x8b &&
-       (rcode[pc+2] & 0xc7) == 0x05) {
-      int32_t disp = *(int32_t *)&rcode[pc+3];
-      intptr_t target = real_handler + pc + 7 + disp;
-      int reg = (rcode[pc+2] >> 3) & 7;
-      const char *rnames[] = {"rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi"};
-      fprintf(fp, "  [%03x] mov %s, [rip+0x%x] -> 0x%lx\n",
-              pc, rnames[reg], disp, (unsigned long)target);
-    }
-  }
-
-try_code_patch:;
-  /* Strategy B: Analyze calls in real handler (read-only).
-   * NOTE: We do NOT write to handler code (text segment) - would panic. */
-  fprintf(fp, "\n  === STRATEGY B: Analyze calls in real handler ===\n");
+  /* Find calls within the real handler */
+  fprintf(fp, "\n  === CALL ANALYSIS in real handler ===\n");
   for(int pc = 0; pc < 507; pc++) {
     if(rcode[pc] == 0xe8) {
       int32_t rel = *(int32_t *)&rcode[pc + 1];
@@ -528,34 +416,214 @@ try_code_patch:;
     }
   }
 
-  /* Strategy C: Analyze code patterns (read-only, for diagnostics) */
-  fprintf(fp, "\n  === STRATEGY C: Code pattern analysis (read-only) ===\n");
+  /* Find RIP-relative data references in handler code */
+  printf("devkitact: phase 3b - finding data refs\n");
+  fprintf(fp, "\n  === DATA REFERENCES in real handler ===\n");
+
+  intptr_t data_candidates[32];
+  int n_candidates = 0;
+
+  for(int pc = 0; pc < 500; pc++) {
+    /* 8b XX [rip+disp32] without REX = mov eXX, [rip+disp32] */
+    if(rcode[pc] == 0x8b && (rcode[pc+1] & 0xc7) == 0x05 && pc + 6 <= 512) {
+      int32_t disp = *(int32_t *)&rcode[pc+2];
+      intptr_t target = real_handler + pc + 6 + disp;
+      int reg = (rcode[pc+1] >> 3) & 7;
+      const char *rn[] = {"eax","ecx","edx","ebx","esp","ebp","esi","edi"};
+      fprintf(fp, "  [%03x] mov %s, [rip+0x%x] -> 0x%lx", pc, rn[reg], disp,
+              (unsigned long)target);
+      if(target >= kdata && target < kdata + 64UL*1024*1024) {
+        int32_t val = 0;
+        kernel_copyout(target, &val, 4);
+        fprintf(fp, " (value=%d/0x%x)", val, val);
+        if(val == 0 && n_candidates < 32)
+          data_candidates[n_candidates++] = target;
+      }
+      fprintf(fp, "\n");
+    }
+
+    /* 48 8b XX [rip+disp32] = mov rXX, [rip+disp32] */
+    if(pc + 7 <= 512 && rcode[pc] == 0x48 && rcode[pc+1] == 0x8b &&
+       (rcode[pc+2] & 0xc7) == 0x05) {
+      int32_t disp = *(int32_t *)&rcode[pc+3];
+      intptr_t target = real_handler + pc + 7 + disp;
+      int reg = (rcode[pc+2] >> 3) & 7;
+      const char *rn[] = {"rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi"};
+      fprintf(fp, "  [%03x] mov %s, [rip+0x%x] -> 0x%lx", pc, rn[reg], disp,
+              (unsigned long)target);
+      if(target >= kdata && target < kdata + 64UL*1024*1024) {
+        int64_t val = 0;
+        kernel_copyout(target, &val, 8);
+        fprintf(fp, " (value=0x%lx)", (unsigned long)val);
+      }
+      fprintf(fp, "\n");
+    }
+
+    /* 48 8d XX [rip+disp32] = lea rXX, [rip+disp32] */
+    if(pc + 7 <= 512 && rcode[pc] == 0x48 && rcode[pc+1] == 0x8d &&
+       (rcode[pc+2] & 0xc7) == 0x05) {
+      int32_t disp = *(int32_t *)&rcode[pc+3];
+      intptr_t target = real_handler + pc + 7 + disp;
+      int reg = (rcode[pc+2] >> 3) & 7;
+      const char *rn[] = {"rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi"};
+      fprintf(fp, "  [%03x] lea %s, [rip+0x%x] -> 0x%lx", pc, rn[reg], disp,
+              (unsigned long)target);
+      if(target >= kdata && target < kdata + 64UL*1024*1024) {
+        int32_t val = 0;
+        kernel_copyout(target, &val, 4);
+        fprintf(fp, " (deref=%d/0x%x)", val, val);
+        if(val == 0 && n_candidates < 32)
+          data_candidates[n_candidates++] = target;
+      }
+      fprintf(fp, "\n");
+    }
+
+    /* 44 8b XX [rip+disp32] = mov r8d-r15d, [rip+disp32] */
+    if(pc + 7 <= 512 && rcode[pc] == 0x44 && rcode[pc+1] == 0x8b &&
+       (rcode[pc+2] & 0xc7) == 0x05) {
+      int32_t disp = *(int32_t *)&rcode[pc+3];
+      intptr_t target = real_handler + pc + 7 + disp;
+      int reg = ((rcode[pc+2] >> 3) & 7) + 8;
+      fprintf(fp, "  [%03x] mov r%dd, [rip+0x%x] -> 0x%lx", pc, reg, disp,
+              (unsigned long)target);
+      if(target >= kdata && target < kdata + 64UL*1024*1024) {
+        int32_t val = 0;
+        kernel_copyout(target, &val, 4);
+        fprintf(fp, " (value=%d/0x%x)", val, val);
+        if(val == 0 && n_candidates < 32)
+          data_candidates[n_candidates++] = target;
+      }
+      fprintf(fp, "\n");
+    }
+  }
+
+  /* Code pattern analysis (read-only) */
+  fprintf(fp, "\n  === CODE PATTERNS (read-only) ===\n");
   for(int pc = 0; pc < 500; pc++) {
     if(rcode[pc] == 0xc7 && rcode[pc+1] == 0x45 &&
        rcode[pc+3] == 0x00 && rcode[pc+4] == 0x00 &&
        rcode[pc+5] == 0x00 && rcode[pc+6] == 0x00) {
-      fprintf(fp, "  [%03x] mov dword [rbp%+d], 0\n",
-              pc, (int8_t)rcode[pc+2]);
+      fprintf(fp, "  [%03x] mov dword [rbp%+d], 0\n", pc, (int8_t)rcode[pc+2]);
     }
     if(pc < 498 && rcode[pc] == 0xc7 && rcode[pc+1] == 0x44 &&
        rcode[pc+2] == 0x24 &&
        rcode[pc+4] == 0x00 && rcode[pc+5] == 0x00 &&
        rcode[pc+6] == 0x00 && rcode[pc+7] == 0x00) {
-      fprintf(fp, "  [%03x] mov dword [rsp+0x%02x], 0\n",
-              pc, rcode[pc+3]);
+      fprintf(fp, "  [%03x] mov dword [rsp+0x%02x], 0\n", pc, rcode[pc+3]);
     }
-    if(rcode[pc] == 0x31 && rcode[pc+1] == 0xc0) {
+    if(rcode[pc] == 0x31 && rcode[pc+1] == 0xc0)
       fprintf(fp, "  [%03x] xor eax,eax (next: %02x)\n",
               pc, pc+2 < 512 ? rcode[pc+2] : 0);
-    }
     if(rcode[pc] == 0xb8 && rcode[pc+1] == 0x00 && rcode[pc+2] == 0x00 &&
-       rcode[pc+3] == 0x00 && rcode[pc+4] == 0x00) {
+       rcode[pc+3] == 0x00 && rcode[pc+4] == 0x00)
       fprintf(fp, "  [%03x] mov eax, 0\n", pc);
-    }
   }
 
+  /* === NOW TRY SAFE DATA-ONLY WRITES === */
+  printf("devkitact: phase 3c - trying data patches\n");
+  int check = -1;
+  size_t clen = sizeof(check);
+
+  /* Strategy 1: Patch data variables referenced by the handler.
+   * These are in kernel DATA segment, safe to write. */
+  fprintf(fp, "\n  === STRATEGY 1: Patch handler's data variables ===\n");
+  fprintf(fp, "  Found %d candidate data addresses with value 0\n", n_candidates);
+
+  for(int i = 0; i < n_candidates; i++) {
+    fprintf(fp, "  Trying candidate %d: 0x%lx\n", i, (unsigned long)data_candidates[i]);
+    int32_t one = 1;
+    kernel_copyin(&one, data_candidates[i], 4);
+    if(!verify_write4(data_candidates[i], 1, fp)) continue;
+
+    check = -1; clen = sizeof(check);
+    sysctlbyname("machdep.check_genuine_devkit_for_psm", &check, &clen, NULL, 0);
+    fprintf(fp, "    -> sysctl = %d\n", check);
+    if(check == 1) {
+      fprintf(fp, "  *** SUCCESS via data variable patch at 0x%lx! ***\n",
+              (unsigned long)data_candidates[i]);
+      goto patched;
+    }
+    int32_t z = 0;
+    kernel_copyin(&z, data_candidates[i], 4);
+  }
+
+  /* Strategy 2: Swap handler to osreldate trampoline + set arg2=1.
+   * Known safe (previously returned 900000 = osreldate value).
+   * If result != 1, it tells us whether dispatch uses arg2 at all. */
+  printf("devkitact: phase 3d - handler swap test\n");
+  fprintf(fp, "\n  === STRATEGY 2: Handler swap to osreldate trampoline ===\n");
+
+  intptr_t arg1_val = 0;
+  int64_t arg2_val = 1;
+  kernel_copyin(&arg1_val, struct_base + 0x20, 8);
+  kernel_copyin(&arg2_val, struct_base + 0x28, 8);
+  fprintf(fp, "  arg1 write: "); verify_write8(struct_base + 0x20, 0, fp);
+  fprintf(fp, "  arg2 write: "); verify_write8(struct_base + 0x28, 1, fp);
+
+  uint32_t rw_kind = 0xC0000002;
+  kernel_copyin(&rw_kind, struct_base + 0x1c, 4);
+  fprintf(fp, "  kind write: "); verify_write4(struct_base + 0x1c, rw_kind, fp);
+
+  fprintf(fp, "  Swapping handler to osreldate trampoline 0x%lx\n",
+          (unsigned long)std_handler_tramp);
+  kernel_copyin(&std_handler_tramp, struct_base + 0x38, 8);
+  fprintf(fp, "  handler write: "); verify_write8(struct_base + 0x38, std_handler_tramp, fp);
+
+  check = -1; clen = sizeof(check);
+  sysctlbyname("machdep.check_genuine_devkit_for_psm", &check, &clen, NULL, 0);
+  fprintf(fp, "  After handler swap: value = %d\n", check);
+
+  if(check == 1) {
+    fprintf(fp, "  *** SUCCESS! ***\n");
+    goto patched;
+  }
+
+  /* Also read osreldate's own oid to understand the mechanism */
+  intptr_t ref_base = 0;
+  for(size_t off = 0; off < 64UL * 1024 * 1024; off += chunk_sz) {
+    if(kernel_copyout(kdata + off, buf, chunk_sz)) break;
+    for(size_t i = 0; i + 8 <= chunk_sz; i += 8) {
+      if(*(intptr_t *)&buf[i] == ref_string) {
+        ref_base = kdata + off + i - 0x30;
+        goto found_ref_oid;
+      }
+    }
+  }
+  goto restore_handler;
+
+found_ref_oid:;
+  intptr_t ref_arg1 = 0;
+  int64_t ref_arg2 = 0;
+  kernel_copyout(ref_base + 0x20, &ref_arg1, 8);
+  kernel_copyout(ref_base + 0x28, &ref_arg2, 8);
+  fprintf(fp, "  osreldate oid: arg1=0x%lx, arg2=%ld\n",
+          (unsigned long)ref_arg1, (long)ref_arg2);
+  if(ref_arg1) {
+    int32_t ref_val = 0;
+    kernel_copyout(ref_arg1, &ref_val, 4);
+    fprintf(fp, "  osreldate *arg1 = %d\n", ref_val);
+  }
+
+  /* Dump our oid struct for verification */
+  fprintf(fp, "\n  Our oid after writes:\n");
+  unsigned char oidbuf[0x60];
+  kernel_copyout(struct_base, oidbuf, 0x60);
+  for(int row = 0; row < 0x60; row += 8) {
+    fprintf(fp, "    +%02x: ", row);
+    for(int c = 0; c < 8; c++) fprintf(fp, "%02x ", oidbuf[row+c]);
+    intptr_t qw = *(intptr_t *)&oidbuf[row];
+    fprintf(fp, " (0x%lx)\n", (unsigned long)qw);
+  }
+
+restore_handler:
+  kernel_copyin(&oid_handler_tramp, struct_base + 0x38, 8);
+  /* Restore original kind */
+  uint32_t orig_kind = 0x80000002;
+  kernel_copyin(&orig_kind, struct_base + 0x1c, 4);
+
+try_code_patch:;
   fprintf(fp, "\n  === ALL SAFE STRATEGIES EXHAUSTED ===\n");
-  fprintf(fp, "  (Text segment writes skipped to avoid kernel panic)\n");
+  fprintf(fp, "  (No text segment writes attempted)\n");
   free(buf);
   return;
 
